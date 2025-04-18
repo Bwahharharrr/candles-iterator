@@ -146,6 +146,7 @@ Each daily file should contain the following columns:
 - Dependencies:
   - numpy
   - colorama
+  - [candles-sync](https://github.com/Bwahharharrr/candles-sync) - Required for fetching and synchronizing candle data
 
 ## 📝 License
 
