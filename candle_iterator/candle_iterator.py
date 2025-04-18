@@ -26,6 +26,7 @@ except ImportError:
         YELLOW = ""
         RED = ""
         MAGENTA = ""
+        WHITE = ""
     class Style:
         RESET_ALL = ""
 
@@ -34,6 +35,17 @@ WARNING = Fore.YELLOW + "[WARNING]" + Style.RESET_ALL
 ERROR = Fore.RED + "[ERROR]" + Style.RESET_ALL
 SUCCESS = Fore.GREEN + "[SUCCESS]" + Style.RESET_ALL
 UPDATE = Fore.MAGENTA + "[UPDATE]" + Style.RESET_ALL
+
+# Additional color definitions for CLI output
+COLOR_DIR = Fore.CYAN
+COLOR_FILE = Fore.YELLOW
+COLOR_TIMESTAMPS = Fore.MAGENTA
+COLOR_ROWS = Fore.RED
+COLOR_NEW = Fore.WHITE
+COLOR_VAR = Fore.CYAN
+COLOR_TYPE = Fore.YELLOW
+COLOR_DESC = Fore.MAGENTA
+COLOR_REQ = Fore.RED + "[REQUIRED]" + Style.RESET_ALL
 
 # ----------------------------------------------------------------------
 # 2) LOCAL IMPORT: SYNCHRONIZE FUNCTION
@@ -63,7 +75,7 @@ TIMEFRAMES = {
     "14D": 1_209_600_000
 }
 
-def parse_analysis_tf_tokens(tokens):
+def parse_aggregation_timeframes(tokens):
     """
     Each token can be:
       - exact timeframe e.g. "1h", "4h"
@@ -127,7 +139,7 @@ def parse_single_relation_or_exact(expr):
         return out_set
 
     # If we get here, we cannot parse => skip
-    print(f"{WARNING} Could not parse analysis-tf token: '{expr}'. Skipping.")
+    print(f"{WARNING} Could not parse aggregation-tf token: '{expr}'. Skipping.")
     return set()
 
 # ----------------------------------------------------------------------
@@ -573,23 +585,23 @@ class CandleIterator:
                 ts, candles = self.buffer.pop(0)
                 return CandleClosure(ts, candles)
 
-def analyze_candle_data(
+def create_candle_iterator(
     exchange: str,
     ticker: str,
     base_timeframe: str,
-    analysis_timeframes: List[str],
+    aggregation_timeframes: List[str],
     start_date: str = None,
     end_date: str = None,
     data_dir: str = "~/.corky"
 ) -> Iterator[CandleClosure]:
     """
-    Analyze candle data and yield closures.
+    Aggregate candle data across multiple timeframes.
     
     Args:
         exchange: Exchange name (e.g., 'BITFINEX')
         ticker: Ticker symbol (e.g., 'tBTCUSD')
         base_timeframe: Base timeframe (e.g., '1h')
-        analysis_timeframes: List of timeframes to analyze (e.g., ['1h', '4h', '1D'])
+        aggregation_timeframes: List of timeframes to aggregate data for (e.g., ['1h', '4h', '1D'])
         start_date: Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM)
         end_date: End date (YYYY-MM-DD or YYYY-MM-DD HH:MM)
         data_dir: Base directory for candle data (default: ~/.corky)
@@ -609,16 +621,16 @@ def analyze_candle_data(
     if base_timeframe not in TIMEFRAMES:
         raise ValueError(f"Invalid base timeframe: {base_timeframe}")
     
-    # 3. Parse and validate analysis timeframes
-    parsed_tfs = parse_analysis_tf_tokens(analysis_timeframes)
+    # 3. Parse and validate aggregation timeframes
+    parsed_tfs = parse_aggregation_timeframes(aggregation_timeframes)
     if not parsed_tfs:
-        raise ValueError(f"No valid analysis timeframes found from {analysis_timeframes}")
+        raise ValueError(f"No valid aggregation timeframes found from {aggregation_timeframes}")
 
-    # Check that no analysis-tf is smaller than base
+    # Check that no aggregation-tf is smaller than base
     base_ms = TIMEFRAMES[base_timeframe]
     for tf in parsed_tfs:
         if TIMEFRAMES[tf] < base_ms:
-            raise ValueError(f"Analysis timeframe '{tf}' is smaller than base timeframe '{base_timeframe}'")
+            raise ValueError(f"Aggregation timeframe '{tf}' is smaller than base timeframe '{base_timeframe}'")
 
     # Ensure base timeframe is included
     if base_timeframe not in parsed_tfs:
@@ -648,42 +660,103 @@ def analyze_candle_data(
         data_dir=data_dir
     )
 
-    # 7. Create and return iterator
+    # 7. Synchronize candle data
+    # Convert end_ts (milliseconds) to end_date_str format (YYYY-MM-DD HH:MM)
+    end_date_str = None
+    if end_ts:
+        end_dt = datetime.fromtimestamp(end_ts / 1000, timezone.utc)
+        end_date_str = end_dt.strftime("%Y-%m-%d %H:%M")
+    
+    synchronize_candle_data(
+        exchange=exchange,
+        ticker=ticker,
+        timeframe=base_timeframe,
+        end_date_str=end_date_str,
+        verbose=False
+    )
+
+    # 8. Create and return iterator
     return CandleIterator(config)
 
 # ----------------------------------------------------------------------
 # 6) MAIN
 # ----------------------------------------------------------------------
-def main():
+def parse_args():
+    """
+    Parses command-line arguments with a color-coded help output.
+    """
     parser = argparse.ArgumentParser(
-        description="Analyze candle data across multiple timeframes"
+        description=f"""
+{INFO} Aggregate candle data across multiple timeframes {Style.RESET_ALL}
+
+  {COLOR_VAR}--exchange{Style.RESET_ALL}         {COLOR_TYPE}(str){Style.RESET_ALL}    {COLOR_REQ} {COLOR_DESC}Exchange name (e.g., BITFINEX){Style.RESET_ALL}
+  {COLOR_VAR}--ticker{Style.RESET_ALL}           {COLOR_TYPE}(str){Style.RESET_ALL}    {COLOR_REQ} {COLOR_DESC}Trading pair (e.g., tBTCUSD){Style.RESET_ALL}
+  {COLOR_VAR}--timeframe{Style.RESET_ALL}        {COLOR_TYPE}(str){Style.RESET_ALL}    {COLOR_REQ} {COLOR_DESC}Base timeframe (e.g., 1m, 1h, 1D){Style.RESET_ALL}
+  {COLOR_VAR}--aggregation-tfs{Style.RESET_ALL}  {COLOR_TYPE}(str){Style.RESET_ALL}           {COLOR_DESC}Timeframes to aggregate (e.g., 1h 4h >=2h&<=12h){Style.RESET_ALL}
+  {COLOR_VAR}--start{Style.RESET_ALL}            {COLOR_TYPE}(str){Style.RESET_ALL}           {COLOR_DESC}Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM){Style.RESET_ALL}
+  {COLOR_VAR}--end{Style.RESET_ALL}              {COLOR_TYPE}(str){Style.RESET_ALL}           {COLOR_DESC}End date (YYYY-MM-DD or YYYY-MM-DD HH:MM){Style.RESET_ALL}
+  {COLOR_VAR}--data-dir{Style.RESET_ALL}         {COLOR_TYPE}(str){Style.RESET_ALL}           {COLOR_DESC}Base directory for candle data (default: ~/.corky){Style.RESET_ALL}
+
+{INFO} Example Usage: {Style.RESET_ALL}
+  {COLOR_FILE}python -m candle_iterator --exchange BITFINEX --ticker tBTCUSD --timeframe 1h{Style.RESET_ALL}
+  {COLOR_FILE}python -m candle_iterator --exchange BITFINEX --ticker tBTCUSD --timeframe 1h --aggregation-tfs 1h 4h 1D{Style.RESET_ALL}
+  {COLOR_FILE}python -m candle_iterator --exchange BITFINEX --ticker tBTCUSD --timeframe 1h --aggregation-tfs ">=2h&<=12h"{Style.RESET_ALL}
+  {COLOR_FILE}python -m candle_iterator --exchange BITFINEX --ticker tBTCUSD --timeframe 1h --start "2024-01-01" --end "2024-02-01"{Style.RESET_ALL}
+""",
+        formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("--exchange", required=True)
-    parser.add_argument("--ticker", required=True)
-    parser.add_argument("--timeframe", required=True, help="Base timeframe (e.g. 1h)")
+    
+    parser.add_argument("--exchange", required=True, help="Exchange name (e.g., BITFINEX)")
+    parser.add_argument("--ticker", required=True, help="Trading pair (e.g., tBTCUSD)")
+    parser.add_argument("--timeframe", required=True, help="Base timeframe (e.g., 1h)")
+    parser.add_argument("--aggregation-tfs", nargs="+", default=None,
+                      help="Timeframes to aggregate data for (e.g., 1h 4h >=2h&<=12h). Defaults to base timeframe if not specified.")
     parser.add_argument("--start", help="Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM)")
     parser.add_argument("--end", help="End date (YYYY-MM-DD or YYYY-MM-DD HH:MM)")
-    parser.add_argument("--analysis-tfs", nargs="+", default=["1m","5m","1h","1D"],
-                    help="Timeframes or relational expressions (e.g. 1h 4h >=2h <=12h)")
     parser.add_argument("--data-dir", default="~/.corky",
-                    help="Base directory for candle data")
-    args = parser.parse_args()
+                      help="Base directory for candle data")
+    
+    if len(sys.argv) == 1:
+        print(f"\n{ERROR} No arguments provided! Please specify the required parameters.\n")
+        parser.print_help()
+        sys.exit(1)
+        
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    
+    # Print configuration summary
+    print(f"\n{INFO} Running candle iterator with the following parameters:\n")
+    print(f"  {COLOR_VAR}--exchange{Style.RESET_ALL}         {COLOR_TYPE}(str){Style.RESET_ALL}  {args.exchange}")
+    print(f"  {COLOR_VAR}--ticker{Style.RESET_ALL}           {COLOR_TYPE}(str){Style.RESET_ALL}  {args.ticker}")
+    print(f"  {COLOR_VAR}--timeframe{Style.RESET_ALL}        {COLOR_TYPE}(str){Style.RESET_ALL}  {args.timeframe}")
+    
+    aggregation_tfs = args.aggregation_tfs if args.aggregation_tfs is not None else [args.timeframe]
+    print(f"  {COLOR_VAR}--aggregation-tfs{Style.RESET_ALL}  {COLOR_TYPE}(list){Style.RESET_ALL} {' '.join(aggregation_tfs)}")
+    
+    if args.start:
+        print(f"  {COLOR_VAR}--start{Style.RESET_ALL}            {COLOR_TYPE}(str){Style.RESET_ALL}  {args.start}")
+    if args.end:
+        print(f"  {COLOR_VAR}--end{Style.RESET_ALL}              {COLOR_TYPE}(str){Style.RESET_ALL}  {args.end}")
+    
+    print(f"  {COLOR_VAR}--data-dir{Style.RESET_ALL}         {COLOR_TYPE}(str){Style.RESET_ALL}  {args.data_dir}")
+    print(f"\n{INFO} Starting candle iterator...\n")
 
     try:
-        for closure in analyze_candle_data(
+        for closure in create_candle_iterator(
             exchange=args.exchange,
             ticker=args.ticker,
             base_timeframe=args.timeframe,
-            analysis_timeframes=args.analysis_tfs,
+            aggregation_timeframes=aggregation_tfs,
             start_date=args.start,
             end_date=args.end,
             data_dir=args.data_dir
         ):
             closure.print()
     except ValueError as e:
-        print(f"Error: {e}")
+        print(f"{ERROR} {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
     main()
-

@@ -1,5 +1,4 @@
-from .candle_iterator import analyze_candle_data, main
+from .candle_iterator import create_candle_iterator, main
 
 __version__ = "0.1.0"
-__all__ = ["analyze_candle_data", "main"]
-
+__all__ = ["create_candle_iterator", "main"]

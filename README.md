@@ -1,11 +1,11 @@
 # Candle Iterator 📊
 
-A high-performance Python tool for analyzing financial candlestick data across multiple timeframes. Built for traders and analysts who need to process and analyze time-series market data efficiently.
+A high-performance Python tool for aggregating financial candlestick data across multiple timeframes. Built for traders and analysts who need to process and work with time-series market data efficiently.
 
 ## 🌟 Features
 
 - **Multi-Exchange Support**: Process data from any exchange that follows the standard OHLCV format
-- **Multi-Timeframe Analysis**: Analyze data across multiple timeframes simultaneously
+- **Multi-Timeframe Aggregation**: Aggregate data across multiple timeframes simultaneously
 - **Flexible Timeframe Expressions**: Support for expressions like ">=1h", "<=4h"
 - **Memory Efficient**: Uses iterators to process large datasets without loading everything into memory
 - **Dual Interface**: Both command-line and Python API available
@@ -28,7 +28,7 @@ pip install -e .
 # Basic usage
 candle-iterator --exchange BITFINEX --ticker tBTCUSD --timeframe 1h
 
-# Analyze specific date range
+# Aggregate specific date range
 candle-iterator \
     --exchange BITFINEX \
     --ticker tBTCUSD \
@@ -36,35 +36,42 @@ candle-iterator \
     --start "2024-02-17 00:00" \
     --end "2024-02-17 23:00"
 
-# Custom analysis timeframes
+# Custom aggregation timeframes
 candle-iterator \
     --exchange BITFINEX \
     --ticker tBTCUSD \
     --timeframe 1h \
-    --analysis-tfs ">=1h" "<=12h" "1D"
+    --aggregation-tfs >=1h <=12h 1D
+
+# Aggregate only hourly timeframes between 2h and 12h
+candle-iterator \
+    --exchange BITFINEX \
+    --ticker tBTCUSD \
+    --timeframe 1h \
+    --aggregation-tfs ">=2h&<=12h"
 ```
 
 ### Python API
 
 ```python
-from candle_iterator import analyze_candle_data
+from candle_iterator import create_candle_iterator
 
 # Basic usage
-for closure in analyze_candle_data(
+for closure in create_candle_iterator(
     exchange="BITFINEX",
     ticker="tBTCUSD",
     base_timeframe="1h",
-    analysis_timeframes=[">=1h"]
+    aggregation_timeframes=["1h"]
 ):
     hourly = closure.get_candle("1h")
     print(f"Hourly close at {hourly.datetime}: {hourly.close}")
 
 # Advanced usage with multiple timeframes
-for closure in analyze_candle_data(
+for closure in create_candle_iterator(
     exchange="BITFINEX",
     ticker="tBTCUSD",
     base_timeframe="1h",
-    analysis_timeframes=["1h", "4h", "1D"],
+    aggregation_timeframes=["1h", "4h", "1D"],
     start_date="2024-02-17 00:00",
     end_date="2024-02-17 23:00"
 ):
