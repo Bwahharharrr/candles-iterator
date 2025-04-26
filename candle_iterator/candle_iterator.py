@@ -465,7 +465,7 @@ class CandleIterator:
         self.buffer = []
         self.current_rows = None
         self.current_row_index = 0
-        print(f"Iterator initialized: start={self.current_day}, end={datetime.fromtimestamp(config.end_ts / 1000, tz=timezone.utc)}")
+        print(f"Iterator initialized: start={self.current_day}, end={'No end date' if not hasattr(config, 'end_ts') or config.end_ts is None else datetime.fromtimestamp(config.end_ts / 1000, tz=timezone.utc)}")
 
     def process_row(self, row):
         """Process a single CSV row"""
@@ -474,7 +474,7 @@ class CandleIterator:
             # Skip if timestamp is outside our range
             if ts < self.config.start_ts:
                 return None
-            if ts > self.config.end_ts:
+            if hasattr(self.config, 'end_ts') and self.config.end_ts is not None and ts > self.config.end_ts:
                 print(f"Reached end timestamp: {ts} > {self.config.end_ts}")
                 return None
                 
@@ -492,7 +492,7 @@ class CandleIterator:
 
     def load_next_file(self):
         """Load next CSV file"""
-        end_date = datetime.fromtimestamp(self.config.end_ts / 1000, tz=timezone.utc).date()
+        end_date = datetime.fromtimestamp(self.config.end_ts / 1000, tz=timezone.utc).date() if self.config.end_ts is not None else datetime.now(timezone.utc).date()
         
         # First check if we're already past the end date
         if self.current_day.date() > end_date:
@@ -642,8 +642,8 @@ def create_candle_iterator(
     
     if start_ts is None:
         start_ts = int((datetime.now(timezone.utc) - timedelta(days=300)).timestamp() * 1000)
-    if end_ts is None:
-        end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+    # if end_ts is None:
+    #     end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     # 5. Initialize aggregator manager
     global aggregator_manager  # Make it accessible globally
@@ -667,6 +667,8 @@ def create_candle_iterator(
         end_dt = datetime.fromtimestamp(end_ts / 1000, timezone.utc)
         end_date_str = end_dt.strftime("%Y-%m-%d %H:%M")
     
+    pprint(end_date_str)
+
     synchronize_candle_data(
         exchange=exchange,
         ticker=ticker,
