@@ -554,7 +554,7 @@ class CandleIterator:
             candle = self.process_row(row)
             if candle is None:
                 # If we're past end timestamp, stop iteration
-                if int(row["timestamp"]) > self.config.end_ts:
+                if self.config.end_ts is not None and int(row["timestamp"]) > self.config.end_ts:
                     print(f"Stopping - timestamp {row['timestamp']} > end {self.config.end_ts}")
                     flush_results = aggregator_manager.flush()
                     if flush_results:
