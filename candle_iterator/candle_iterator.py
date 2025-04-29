@@ -2,15 +2,16 @@
 
 import argparse
 import csv
-import math
+import json
 import os
-import sys
 import re
+import sys
 import numpy as np
-from pprint import pprint
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Iterator
+from pathlib import Path
+from pprint import pprint
 
 # ----------------------------------------------------------------------
 # 1) COLOR & LOGGING SETUP
@@ -465,6 +466,7 @@ class CandleIterator:
         self.buffer = []
         self.current_rows = None
         self.current_row_index = 0
+
         print(f"Iterator initialized: start={self.current_day}, end={'No end date' if not hasattr(config, 'end_ts') or config.end_ts is None else datetime.fromtimestamp(config.end_ts / 1000, tz=timezone.utc)}")
 
     def process_row(self, row):
@@ -528,6 +530,7 @@ class CandleIterator:
         return self
 
     def __next__(self):
+
         while True:
             # Process buffered results first
             if self.buffer:
@@ -543,7 +546,6 @@ class CandleIterator:
                         self.buffer.extend(flush_results)
                         ts, candles = self.buffer.pop(0)
                         return CandleClosure(ts, candles)
-                    print("Iterator complete - no more data")
                     raise StopIteration
                 continue
 
@@ -555,7 +557,6 @@ class CandleIterator:
             if candle is None:
                 # If we're past end timestamp, stop iteration
                 if self.config.end_ts is not None and int(row["timestamp"]) > self.config.end_ts:
-                    print(f"Stopping - timestamp {row['timestamp']} > end {self.config.end_ts}")
                     flush_results = aggregator_manager.flush()
                     if flush_results:
                         self.buffer.extend(flush_results)
@@ -566,17 +567,28 @@ class CandleIterator:
                 
             ts, o, h, l, c, v = candle
 
-            # Handle 1m gaps if needed
-            if self.config.base_timeframe == "1m" and self.last_ts is not None:
-                expected_ts = self.last_ts + 60_000
-                while expected_ts < ts:
-                    results = aggregator_manager.on_subcandle(expected_ts, c, c, c, c, 0.0)
-                    if results:
-                        self.buffer.extend(results)
-                        ts, candles = self.buffer.pop(0)
-                        return CandleClosure(ts, candles)
-                    expected_ts += 60_000
+            # Handle gap for the base timeframe if needed
+            if self.config.base_timeframe in TIMEFRAMES and self.last_ts is not None:
+                gap_ms = TIMEFRAMES[self.config.base_timeframe]
+                expected_ts = self.last_ts + gap_ms
+                if expected_ts < ts:
+                    self.last_ts = expected_ts
 
+                    # Produce the 'fake' candle
+                    results = aggregator_manager.on_subcandle(
+                        expected_ts,
+                        c, c, c, c,  # or self.last_close if you prefer
+                        0.0
+                    )
+                    self.buffer.extend(results)
+
+                    # If aggregator_manager signals a closure, yield or return it
+                    if self.buffer:
+                        out_ts, candles = self.buffer.pop(0)
+                        self.current_row_index -= 1
+                        return CandleClosure(out_ts, candles)
+
+            # Process the real current candle now
             results = aggregator_manager.on_subcandle(ts, o, h, l, c, v)
             self.last_ts = ts
 
@@ -598,13 +610,13 @@ def create_candle_iterator(
     Aggregate candle data across multiple timeframes.
     
     Args:
-        exchange: Exchange name (e.g., 'BITFINEX')
-        ticker: Ticker symbol (e.g., 'tBTCUSD')
-        base_timeframe: Base timeframe (e.g., '1h')
-        aggregation_timeframes: List of timeframes to aggregate data for (e.g., ['1h', '4h', '1D'])
+        exchange: Exchange name
+        ticker: Ticker symbol
+        base_timeframe: Base timeframe
+        aggregation_timeframes: List of timeframes to aggregate data for
         start_date: Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM)
         end_date: End date (YYYY-MM-DD or YYYY-MM-DD HH:MM)
-        data_dir: Base directory for candle data (default: ~/.corky)
+        data_dir: Base directory for data
     
     Returns:
         Iterator yielding CandleClosure objects
@@ -641,7 +653,9 @@ def create_candle_iterator(
     end_ts = parse_timestamp(end_date, False)
     
     if start_ts is None:
-        start_ts = int((datetime.now(timezone.utc) - timedelta(days=300)).timestamp() * 1000)
+        dt = datetime.now(timezone.utc) - timedelta(days=300)
+        dt_midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_ts = int(dt_midnight.timestamp() * 1000)
     # if end_ts is None:
     #     end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -660,6 +674,8 @@ def create_candle_iterator(
         data_dir=data_dir
     )
 
+    print(config.__dict__)
+
     # 7. Synchronize candle data
     # Convert end_ts (milliseconds) to end_date_str format (YYYY-MM-DD HH:MM)
     end_date_str = None
@@ -667,8 +683,6 @@ def create_candle_iterator(
         end_dt = datetime.fromtimestamp(end_ts / 1000, timezone.utc)
         end_date_str = end_dt.strftime("%Y-%m-%d %H:%M")
     
-    pprint(end_date_str)
-
     synchronize_candle_data(
         exchange=exchange,
         ticker=ticker,
@@ -676,6 +690,7 @@ def create_candle_iterator(
         end_date_str=end_date_str,
         verbose=False
     )
+
 
     # 8. Create and return iterator
     return CandleIterator(config)
@@ -708,9 +723,9 @@ def parse_args():
         formatter_class=argparse.RawTextHelpFormatter
     )
     
-    parser.add_argument("--exchange", required=True, help="Exchange name (e.g., BITFINEX)")
-    parser.add_argument("--ticker", required=True, help="Trading pair (e.g., tBTCUSD)")
-    parser.add_argument("--timeframe", required=True, help="Base timeframe (e.g., 1h)")
+    parser.add_argument("--exchange", required=True, help="Exchange name")
+    parser.add_argument("--ticker", required=True, help="Trading pair")
+    parser.add_argument("--timeframe", required=True, help="Base timeframe")
     parser.add_argument("--aggregation-tfs", nargs="+", default=None,
                       help="Timeframes to aggregate data for (e.g., 1h 4h >=2h&<=12h). Defaults to base timeframe if not specified.")
     parser.add_argument("--start", help="Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM)")
@@ -756,6 +771,8 @@ def main():
             data_dir=args.data_dir
         ):
             closure.print()
+            # pass
+
     except ValueError as e:
         print(f"{ERROR} {e}")
         sys.exit(1)
