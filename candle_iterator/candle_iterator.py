@@ -414,8 +414,17 @@ class Candle:
                 f"c={self.close},v={self.volume}")
 
 class CandleClosure:
-    def __init__(self, timestamp: int, candles: List[Tuple]):
+    """Represents a set of closed candles for multiple timeframes at one specific base timestamp."""
+    def __init__(self, timestamp: int, candles: List[Tuple[str, int, float, float, float, float, float]]):
+        """
+        Initialize a candle closure with:
+        
+        Args:
+            timestamp: The closure timestamp in millis
+            candles: List of (timeframe, label_ts, o, h, l, c, vol) tuples
+        """
         self.timestamp = timestamp
+        self._now_ms = None  # Storage for computed now_ms to avoid recalculation
         self.candles: Dict[str, Candle] = {}
         
         # Convert raw tuples to Candle objects
@@ -441,20 +450,19 @@ class CandleClosure:
         """Get candle data for specific timeframe"""
         return self.candles.get(timeframe)
     
-    def print(self, end_ms: Optional[int] = None) -> None:
+    def print(self, now_ms: Optional[int] = None) -> None:
         """
         Print closure in formatted way
         
         Args:
-            end_ms: Optional reference timestamp in milliseconds to check if candles are closed
-                   If None, all candles are considered closed
+            now_ms: Optional reference timestamp in milliseconds representing "now" to check if candles are closed
+                   If None, will use stored value or calculate current time if no stored value exists
         """
         dt_str = self.datetime.strftime("%Y-%m-%d %H:%M")
         
         # Check if base candle is closed (no need to specify timeframe, will use base)
-        is_base_closed = True  # Default if end_ms is None
-        if end_ms is not None:
-            is_base_closed = self.is_closed(end_ms=end_ms)  # Using default timeframe (base)
+        # The is_closed method will handle storing now_ms for us
+        is_base_closed = self.is_closed(now_ms=now_ms)  # Using default timeframe (base)
         
         # Set the status text and color based on closure
         status_text = "Closed" if is_base_closed else "Unclosed"
@@ -467,20 +475,28 @@ class CandleClosure:
             candle = self.candles[tf]
             print(f"  - {Fore.GREEN}{candle}{Style.RESET_ALL}")
     
-    def is_closed(self, timeframe: Optional[str] = None, end_ms: Optional[int] = None) -> bool:
+    def is_closed(self, timeframe: Optional[str] = None, now_ms: Optional[int] = None) -> bool:
         """
         Determine if a candle has closed by checking if its end time has passed.
         
         Args:
             timeframe: The timeframe to check (e.g., "1h", "4h"). If None, uses the lowest/base timeframe.
-            end_ms: Optional reference timestamp in milliseconds. If None, uses current time.
+            now_ms: Optional reference timestamp in milliseconds representing "now". If None, uses current time.
                 
         Returns:
             bool: True if the candle is closed, False if still open
         """
-        # Use current time in milliseconds if end_ms is not provided
-        if end_ms is None:
-            end_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        # Use current time in milliseconds if now_ms is not provided
+        if now_ms is None:
+            # If we already computed now_ms previously, use that value
+            if self._now_ms is not None:
+                now_ms = self._now_ms
+            else:
+                now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+                self._now_ms = now_ms  # Store for future use
+        else:
+            # Update stored value if a new one is provided
+            self._now_ms = now_ms
             
         # If timeframe not provided, use the lowest/base timeframe
         if timeframe is None:
@@ -494,7 +510,7 @@ class CandleClosure:
             raise ValueError(f"No candle data available for timeframe {timeframe}")
             
         # Check if candle's end time has passed
-        return candle.timestamp + TIMEFRAMES[timeframe] < end_ms
+        return candle.timestamp + TIMEFRAMES[timeframe] < now_ms
 
     def __str__(self) -> str:
         """String representation of closure"""

@@ -84,7 +84,7 @@ def main():
         ):
             # Get current time in milliseconds to check if candles are closed
             current_time_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-            closure.print(end_ms=current_time_ms)
+            closure.print(now_ms=current_time_ms)
 
     except ValueError as e:
         print(f"{ERROR} {e}")
