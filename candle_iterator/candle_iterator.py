@@ -770,8 +770,8 @@ def main():
             end_date=args.end,
             data_dir=args.data_dir
         ):
-            closure.print()
-            # pass
+            # closure.print()
+            pass
 
     except ValueError as e:
         print(f"{ERROR} {e}")

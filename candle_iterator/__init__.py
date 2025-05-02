@@ -1,4 +1,4 @@
-from .candle_iterator import create_candle_iterator, main
+from .candle_iterator import create_candle_iterator, main, TIMEFRAMES
 
 __version__ = "0.1.0"
-__all__ = ["create_candle_iterator", "main"]
+__all__ = ["create_candle_iterator", "main", "TIMEFRAMES"]
