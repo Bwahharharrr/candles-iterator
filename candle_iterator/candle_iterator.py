@@ -9,7 +9,7 @@ import sys
 import numpy as np
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Iterator
+from typing import List, Tuple, Dict, Iterator, Optional
 from pathlib import Path
 from pprint import pprint
 
@@ -441,23 +441,65 @@ class CandleClosure:
         """Get candle data for specific timeframe"""
         return self.candles.get(timeframe)
     
-    def print(self) -> None:
-        """Print closure in formatted way"""
+    def print(self, end_ms: Optional[int] = None) -> None:
+        """
+        Print closure in formatted way
+        
+        Args:
+            end_ms: Optional reference timestamp in milliseconds to check if candles are closed
+                   If None, all candles are considered closed
+        """
         dt_str = self.datetime.strftime("%Y-%m-%d %H:%M")
-        print(f"{Fore.CYAN}Closed{Style.RESET_ALL} "
+        
+        # Get the base timeframe (smallest timeframe)
+        base_tf = self.timeframes[0] if self.timeframes else None
+        
+        # Check if base candle is closed if end_ms is provided
+        is_base_closed = True  # Default if end_ms is None
+        if end_ms is not None and base_tf is not None:
+            is_base_closed = self.is_closed(base_tf, end_ms)
+        
+        # Set the status text and color based on closure
+        status_text = "Closed" if is_base_closed else "Unclosed"
+        status_color = Fore.CYAN if is_base_closed else Fore.RED
+        
+        print(f"{status_color}{status_text}{Style.RESET_ALL} "
               f"({Fore.YELLOW}{self.timestamp}{Style.RESET_ALL}) {dt_str}")
         
         for tf in self.timeframes:
             candle = self.candles[tf]
             print(f"  - {Fore.GREEN}{candle}{Style.RESET_ALL}")
     
+    def is_closed(self, timeframe: str, end_ms: Optional[int] = None) -> bool:
+        """
+        Determine if a candle has closed by checking if its end time has passed.
+        
+        Args:
+            timeframe: The timeframe to check (e.g., "1h", "4h")
+            end_ms: Optional reference timestamp in milliseconds. If None, uses current time.
+                
+        Returns:
+            bool: True if the candle is closed, False if still open
+        """
+        # Use current time in milliseconds if end_ms is not provided
+        if end_ms is None:
+            end_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+            
+        # Get the candle for this timeframe
+        candle = self.get_candle(timeframe)
+        if candle is None:
+            raise ValueError(f"No candle data available for timeframe {timeframe}")
+            
+        # Check if candle's end time has passed
+        return candle.timestamp + TIMEFRAMES[timeframe] < end_ms
+
     def __str__(self) -> str:
         """String representation of closure"""
         parts = [f"Closure at {self.datetime}:"]
         for tf in self.timeframes:
             parts.append(f"  {self.candles[tf]}")
         return "\n".join(parts)
-
+        
 class CandleIterator:
     def __init__(self, config):
         self.config = config
@@ -695,87 +737,6 @@ def create_candle_iterator(
     # 8. Create and return iterator
     return CandleIterator(config)
 
-# ----------------------------------------------------------------------
-# 6) MAIN
-# ----------------------------------------------------------------------
-def parse_args():
-    """
-    Parses command-line arguments with a color-coded help output.
-    """
-    parser = argparse.ArgumentParser(
-        description=f"""
-{INFO} Aggregate candle data across multiple timeframes {Style.RESET_ALL}
-
-  {COLOR_VAR}--exchange{Style.RESET_ALL}         {COLOR_TYPE}(str){Style.RESET_ALL}    {COLOR_REQ} {COLOR_DESC}Exchange name (e.g., BITFINEX){Style.RESET_ALL}
-  {COLOR_VAR}--ticker{Style.RESET_ALL}           {COLOR_TYPE}(str){Style.RESET_ALL}    {COLOR_REQ} {COLOR_DESC}Trading pair (e.g., tBTCUSD){Style.RESET_ALL}
-  {COLOR_VAR}--timeframe{Style.RESET_ALL}        {COLOR_TYPE}(str){Style.RESET_ALL}    {COLOR_REQ} {COLOR_DESC}Base timeframe (e.g., 1m, 1h, 1D){Style.RESET_ALL}
-  {COLOR_VAR}--aggregation-tfs{Style.RESET_ALL}  {COLOR_TYPE}(str){Style.RESET_ALL}           {COLOR_DESC}Timeframes to aggregate (e.g., 1h 4h >=2h&<=12h){Style.RESET_ALL}
-  {COLOR_VAR}--start{Style.RESET_ALL}            {COLOR_TYPE}(str){Style.RESET_ALL}           {COLOR_DESC}Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM){Style.RESET_ALL}
-  {COLOR_VAR}--end{Style.RESET_ALL}              {COLOR_TYPE}(str){Style.RESET_ALL}           {COLOR_DESC}End date (YYYY-MM-DD or YYYY-MM-DD HH:MM){Style.RESET_ALL}
-  {COLOR_VAR}--data-dir{Style.RESET_ALL}         {COLOR_TYPE}(str){Style.RESET_ALL}           {COLOR_DESC}Base directory for candle data (default: ~/.corky){Style.RESET_ALL}
-
-{INFO} Example Usage: {Style.RESET_ALL}
-  {COLOR_FILE}python -m candle_iterator --exchange BITFINEX --ticker tBTCUSD --timeframe 1h{Style.RESET_ALL}
-  {COLOR_FILE}python -m candle_iterator --exchange BITFINEX --ticker tBTCUSD --timeframe 1h --aggregation-tfs 1h 4h 1D{Style.RESET_ALL}
-  {COLOR_FILE}python -m candle_iterator --exchange BITFINEX --ticker tBTCUSD --timeframe 1h --aggregation-tfs ">=2h&<=12h"{Style.RESET_ALL}
-  {COLOR_FILE}python -m candle_iterator --exchange BITFINEX --ticker tBTCUSD --timeframe 1h --start "2024-01-01" --end "2024-02-01"{Style.RESET_ALL}
-""",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    
-    parser.add_argument("--exchange", required=True, help="Exchange name")
-    parser.add_argument("--ticker", required=True, help="Trading pair")
-    parser.add_argument("--timeframe", required=True, help="Base timeframe")
-    parser.add_argument("--aggregation-tfs", nargs="+", default=None,
-                      help="Timeframes to aggregate data for (e.g., 1h 4h >=2h&<=12h). Defaults to base timeframe if not specified.")
-    parser.add_argument("--start", help="Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM)")
-    parser.add_argument("--end", help="End date (YYYY-MM-DD or YYYY-MM-DD HH:MM)")
-    parser.add_argument("--data-dir", default="~/.corky",
-                      help="Base directory for candle data")
-    
-    if len(sys.argv) == 1:
-        print(f"\n{ERROR} No arguments provided! Please specify the required parameters.\n")
-        parser.print_help()
-        sys.exit(1)
-        
-    return parser.parse_args()
-
-def main():
-    args = parse_args()
-    
-    # Print configuration summary
-    print(f"\n{INFO} Running candle iterator with the following parameters:\n")
-    print(f"  {COLOR_VAR}--exchange{Style.RESET_ALL}         {COLOR_TYPE}(str){Style.RESET_ALL}  {args.exchange}")
-    print(f"  {COLOR_VAR}--ticker{Style.RESET_ALL}           {COLOR_TYPE}(str){Style.RESET_ALL}  {args.ticker}")
-    print(f"  {COLOR_VAR}--timeframe{Style.RESET_ALL}        {COLOR_TYPE}(str){Style.RESET_ALL}  {args.timeframe}")
-    
-    aggregation_tfs = args.aggregation_tfs if args.aggregation_tfs is not None else [args.timeframe]
-    print(f"  {COLOR_VAR}--aggregation-tfs{Style.RESET_ALL}  {COLOR_TYPE}(list){Style.RESET_ALL} {' '.join(aggregation_tfs)}")
-    
-    if args.start:
-        print(f"  {COLOR_VAR}--start{Style.RESET_ALL}            {COLOR_TYPE}(str){Style.RESET_ALL}  {args.start}")
-    if args.end:
-        print(f"  {COLOR_VAR}--end{Style.RESET_ALL}              {COLOR_TYPE}(str){Style.RESET_ALL}  {args.end}")
-    
-    print(f"  {COLOR_VAR}--data-dir{Style.RESET_ALL}         {COLOR_TYPE}(str){Style.RESET_ALL}  {args.data_dir}")
-    print(f"\n{INFO} Starting candle iterator...\n")
-
-    try:
-        for closure in create_candle_iterator(
-            exchange=args.exchange,
-            ticker=args.ticker,
-            base_timeframe=args.timeframe,
-            aggregation_timeframes=aggregation_tfs,
-            start_date=args.start,
-            end_date=args.end,
-            data_dir=args.data_dir
-        ):
-            # closure.print()
-            pass
-
-    except ValueError as e:
-        print(f"{ERROR} {e}")
-        sys.exit(1)
-
 if __name__ == "__main__":
-    main()
+    print(f"{ERROR} This module should not be run directly. Use the example.py script instead.")
+    sys.exit(1)
