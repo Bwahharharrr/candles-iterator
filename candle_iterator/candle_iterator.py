@@ -451,13 +451,10 @@ class CandleClosure:
         """
         dt_str = self.datetime.strftime("%Y-%m-%d %H:%M")
         
-        # Get the base timeframe (smallest timeframe)
-        base_tf = self.timeframes[0] if self.timeframes else None
-        
-        # Check if base candle is closed if end_ms is provided
+        # Check if base candle is closed (no need to specify timeframe, will use base)
         is_base_closed = True  # Default if end_ms is None
-        if end_ms is not None and base_tf is not None:
-            is_base_closed = self.is_closed(base_tf, end_ms)
+        if end_ms is not None:
+            is_base_closed = self.is_closed(end_ms=end_ms)  # Using default timeframe (base)
         
         # Set the status text and color based on closure
         status_text = "Closed" if is_base_closed else "Unclosed"
@@ -470,12 +467,12 @@ class CandleClosure:
             candle = self.candles[tf]
             print(f"  - {Fore.GREEN}{candle}{Style.RESET_ALL}")
     
-    def is_closed(self, timeframe: str, end_ms: Optional[int] = None) -> bool:
+    def is_closed(self, timeframe: Optional[str] = None, end_ms: Optional[int] = None) -> bool:
         """
         Determine if a candle has closed by checking if its end time has passed.
         
         Args:
-            timeframe: The timeframe to check (e.g., "1h", "4h")
+            timeframe: The timeframe to check (e.g., "1h", "4h"). If None, uses the lowest/base timeframe.
             end_ms: Optional reference timestamp in milliseconds. If None, uses current time.
                 
         Returns:
@@ -484,6 +481,12 @@ class CandleClosure:
         # Use current time in milliseconds if end_ms is not provided
         if end_ms is None:
             end_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+            
+        # If timeframe not provided, use the lowest/base timeframe
+        if timeframe is None:
+            if not self.timeframes:
+                raise ValueError("No timeframes available in this closure")
+            timeframe = self.timeframes[0]  # timeframes property returns sorted by duration
             
         # Get the candle for this timeframe
         candle = self.get_candle(timeframe)
