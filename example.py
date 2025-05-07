@@ -44,6 +44,8 @@ Iterate through candlestick data from the .corky data directory.
     parser.add_argument("--end", help="End date (YYYY-MM-DD or YYYY-MM-DD HH:MM)")
     parser.add_argument("--data-dir", default="~/.corky",
                       help="Base directory for candle data")
+    parser.add_argument("--verbose", action="store_true",
+                      help="Print detailed debug information")
     
     if len(sys.argv) == 1:
         print(f"\n{ERROR} No arguments provided! Please specify the required parameters.\n")
@@ -70,6 +72,7 @@ def main():
         print(f"  {COLOR_VAR}--end{Style.RESET_ALL}              {COLOR_TYPE}(str){Style.RESET_ALL}  {args.end}")
     
     print(f"  {COLOR_VAR}--data-dir{Style.RESET_ALL}         {COLOR_TYPE}(str){Style.RESET_ALL}  {args.data_dir}")
+    print(f"  {COLOR_VAR}--verbose{Style.RESET_ALL}          {COLOR_TYPE}(bool){Style.RESET_ALL} {args.verbose}")
     print(f"\n{INFO} Starting candle iterator...\n")
 
     try:
@@ -80,11 +83,12 @@ def main():
             aggregation_timeframes=aggregation_tfs,
             start_date=args.start,
             end_date=args.end,
-            data_dir=args.data_dir
+            data_dir=args.data_dir,
+            verbose=args.verbose
         ):
             # Get current time in milliseconds to check if candles are closed
-            current_time_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-            closure.print(now_ms=current_time_ms)
+            closure.print()
+            pass 
 
     except ValueError as e:
         print(f"{ERROR} {e}")
