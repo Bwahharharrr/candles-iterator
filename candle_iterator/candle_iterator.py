@@ -195,7 +195,7 @@ class CandleClosure:
 class CandleAggregator:
     """
     Aggregator for one timeframe.
-    - If is_base=True, we treat incoming subcandles as partial real-time data. 
+    - If is_base=True, we treat incoming subcandles as partial real-time data.
       We finalize them only if they are definitely behind us or the next row jumps forward.
     - If is_base=False, we accumulate a certain number of subcandles (sub_factor),
       or fill zero-volume for missing intervals, etc.
@@ -220,6 +220,10 @@ class CandleAggregator:
         self.last_sub_ts = None
 
     def on_base_csv_row(self, ts, o, h, l, c, v):
+        """
+        Called only for the base aggregator. We accept each 1m row as partial real‐time data,
+        finalizing if the row's ts jumps beyond the aggregator boundary.
+        """
         if not self.is_base:
             raise RuntimeError("Called on_base_csv_row() on a non-base aggregator? (bug)")
 
@@ -231,7 +235,7 @@ class CandleAggregator:
         if self.current_boundary is None:
             self.current_boundary = (base_ts // self.tf_ms) * self.tf_ms
 
-        # If new row's time is beyond the boundary by >= 1 TF => finalize old candle
+        # Possibly finalize older candles if we've jumped one or more intervals
         while self.current_boundary + self.tf_ms <= base_ts:
             if self.sub_count > 0:
                 self._finalize_aggregator_candle(real_event_ts=self.last_sub_ts or self.current_boundary)
@@ -250,6 +254,7 @@ class CandleAggregator:
             self.volume = 0.0
             self.sub_count = 0
 
+        # Update OHLC
         self.high_px = max(self.high_px, h)
         self.low_px = min(self.low_px, l)
         self.close_px = c
@@ -258,6 +263,7 @@ class CandleAggregator:
         self.last_sub_ts = base_ts
 
         # If we are behind the boundary => finalize
+        # (Case: If this row is clearly in the past relative to aggregator boundary.)
         fully_behind_now = (base_ts + self.tf_ms <= now_ms)
         if (base_ts > (self.current_boundary + self.tf_ms - 1)) or fully_behind_now:
             self._finalize_aggregator_candle(real_event_ts=base_ts)
@@ -266,24 +272,30 @@ class CandleAggregator:
 
     def on_base_candle_closed(self, base_ts, o, h, l, c, v):
         """
-        For higher timeframes. Each base candle is a subcandle. Once we accumulate sub_factor or jump forward, finalize.
+        For higher timeframes (is_base=False). We accumulate each 'closed' 1m candle as a subcandle.
+        Once we have sub_factor subcandles, we finalize.
+        Also handle multi-interval jumps (filling zero if needed).
         """
         if self.is_base:
             raise RuntimeError("Base aggregator called on_base_candle_closed? (bug)")
 
+        # If our boundary is None, align to the base_ts
         if self.current_boundary is None:
-            aligned = (base_ts // self.tf_ms) * self.tf_ms
-            self.current_boundary = aligned
+            self.current_boundary = (base_ts // self.tf_ms) * self.tf_ms
 
-        # If we jumped multiple intervals
-        while self.current_boundary + self.tf_ms < base_ts:
+        # If we jumped multiple intervals:
+        while base_ts >= self.current_boundary + self.tf_ms:
+            # finalize or record zero
             if self.sub_count > 0:
+                # finalize what we had
                 self._finalize_aggregator_candle(real_event_ts=self.last_sub_ts or self.current_boundary)
             else:
+                # record zero
                 self._record_zero_candle(real_event_ts=self.last_sub_ts or self.current_boundary)
             self.current_boundary += self.tf_ms
             self.reset()
 
+        # Initialize aggregator candle if none open
         if self.open_ts is None:
             self.open_ts = self.current_boundary
             self.open_px = o
@@ -293,6 +305,7 @@ class CandleAggregator:
             self.volume = 0.0
             self.sub_count = 0
 
+        # Update OHLC data
         self.high_px = max(self.high_px, h)
         self.low_px = min(self.low_px, l)
         self.close_px = c
@@ -300,12 +313,11 @@ class CandleAggregator:
         self.sub_count += 1
         self.last_sub_ts = base_ts
 
-        # finalize if sub_count >= sub_factor and we passed boundary
+        # If we've now reached the sub_factor (e.g. 5 subcandles => 5m), finalize immediately
         if self.sub_count >= self.sub_factor:
-            if base_ts > self.current_boundary + self.tf_ms - 1:
-                self._finalize_aggregator_candle(real_event_ts=base_ts)
-                self.current_boundary += self.tf_ms
-                self.reset()
+            self._finalize_aggregator_candle(real_event_ts=base_ts)
+            self.current_boundary += self.tf_ms
+            self.reset()
 
     def _record_zero_candle(self, real_event_ts):
         aggregator_manager.record_closure(
@@ -337,6 +349,9 @@ class CandleAggregator:
         )
 
     def get_current_open_candle(self) -> Optional[Candle]:
+        """
+        Returns the partial candle if still open; None if aggregator is not tracking any open candle.
+        """
         if self.open_ts is None:
             return None
         return Candle(
@@ -394,7 +409,7 @@ class AggregatorManager:
         """
         Called for each row of base timeframe data.
         """
-        # We clear old closures from the prior subcandle
+        # Clear old closures from the prior subcandle
         self.pending_closures.clear()
 
         # Feed it into the base aggregator
@@ -416,6 +431,7 @@ class AggregatorManager:
                     closed_candles[tf] = Candle(tfid, lbl_ts, oo, hh, ll, cc, vv)
 
             open_candles: Dict[str, Candle] = {}
+            # Gather current open from each aggregator
             for agg in self.higher_aggs:
                 oc = agg.get_current_open_candle()
                 if oc:
@@ -440,7 +456,7 @@ class AggregatorManager:
         Called when no more data rows are available. We forcibly finalize behind-candles,
         and (once only) produce a final partial closure if any aggregator is still open.
         """
-        # Possibly finalize the base aggregator if it's truly behind now
+        # Possibly finalize the base aggregator if it's behind now
         if self.base_agg.open_ts is not None:
             now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             if self.base_agg.open_ts + self.base_agg.tf_ms <= now_ms:
@@ -453,16 +469,16 @@ class AggregatorManager:
         # Do the same for higher aggregators
         for agg in self.higher_aggs:
             if agg.open_ts is not None:
+                # If we have enough subcandles for a full candle, finalize:
                 if agg.sub_count >= agg.sub_factor:
-                    if (agg.last_sub_ts or 0) > (agg.current_boundary + agg.tf_ms - 1):
-                        if self.verbose:
-                            print(
-                                f"{Fore.MAGENTA}[DEBUG]{Style.RESET_ALL} aggregator {agg.tf} forcibly finalizing partial => "
-                                f"sub_count={agg.sub_count}"
-                            )
-                        agg._finalize_aggregator_candle(real_event_ts=agg.last_sub_ts)
-                        agg.current_boundary += agg.tf_ms
-                        agg.reset()
+                    if self.verbose:
+                        print(
+                            f"{Fore.MAGENTA}[DEBUG]{Style.RESET_ALL} forcibly finalizing aggregator {agg.tf} => "
+                            f"sub_count={agg.sub_count}"
+                        )
+                    agg._finalize_aggregator_candle(real_event_ts=agg.last_sub_ts)
+                    agg.current_boundary += agg.tf_ms
+                    agg.reset()
 
         # Grab closures from that forced finalization
         out = []
@@ -549,7 +565,7 @@ class CandleIterator:
         if not os.path.isdir(self.data_path):
             raise ValueError(f"Data directory not found: {self.data_path}")
 
-        self.csv_file_paths = self._list_csv_files()
+        self.csv_file_paths = self._list_csv_files()  # Possibly shortened via date skip
         if self.cfg.verbose:
             print(f"{INFO} Found {len(self.csv_file_paths)} data files for base timeframe: {self.cfg.base_timeframe}")
 
@@ -580,14 +596,34 @@ class CandleIterator:
                 try:
                     row_ts, o, h, l, c, v = next(self._candles_gen)
                 except StopIteration:
-                    # No more real rows => flush aggregator once
-                    flush_closures = aggregator_manager.flush()
+                    # No more CSV rows => do final flush
+                    flush_closures = []
+                    if self._last_ts is not None:
+                        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                        current_minute_boundary = (now_ms // self.base_ms) * self.base_ms
+
+                        if current_minute_boundary > self._last_ts:
+                            # Feed a zero-volume candle for the "current minute" if we moved into a new minute
+                            aggregator_manager.on_subcandle(
+                                current_minute_boundary,
+                                self._last_close,
+                                self._last_close,
+                                self._last_close,
+                                self._last_close,
+                                0.0
+                            )
+                            flush_closures.extend(aggregator_manager._build_and_return_closures())
+
+                    flush_closures_final = aggregator_manager.flush()
+                    flush_closures.extend(flush_closures_final)
+
                     if flush_closures:
                         self._closed_buffer.extend(flush_closures)
                         return self._closed_buffer.pop(0)
                     else:
                         raise StopIteration
 
+            # If first row, set _last_ts
             if self._last_ts is None:
                 self._last_ts = row_ts
                 self._last_close = o
@@ -619,8 +655,8 @@ class CandleIterator:
                 else:
                     continue
 
+            # If row_ts is beyond end_ts, flush aggregator and stop
             if self.cfg.end_ts and row_ts > self.cfg.end_ts:
-                # Past end, flush aggregator
                 flush_closures = aggregator_manager.flush()
                 if flush_closures:
                     self._closed_buffer.extend(flush_closures)
@@ -629,7 +665,7 @@ class CandleIterator:
                     raise StopIteration
 
             if row_ts <= self._last_ts:
-                # Skip duplicates
+                # Skip duplicates or non-increasing
                 if self.cfg.verbose:
                     print(f"{WARNING} Skipping non-increasing timestamp: {row_ts}")
                 continue
@@ -644,6 +680,52 @@ class CandleIterator:
             if self._closed_buffer:
                 return self._closed_buffer.pop(0)
 
+    # ----------------------------------------------------------------------
+    # HELPER FUNCTION to parse day-based filenames into start/end timestamps
+    # ----------------------------------------------------------------------
+    def _file_day_range(self, filename: str) -> Tuple[int, int]:
+        """
+        For 1m data (YYYY-MM-DD.csv), returns (start_ts, end_ts) for that day.
+        For 1h data (YYYY-MM.csv), returns (start_ts, end_ts) for that month.
+        For 1D data (YYYY.csv), returns (start_ts, end_ts) for that year.
+        """
+        base_tf = self.cfg.base_timeframe
+        without_ext = filename.replace(".csv", "")
+
+        if base_tf == "1m":
+            # filename like 2025-05-12.csv
+            y, m, d = without_ext.split("-")
+            dt_start = datetime(int(y), int(m), int(d), 0, 0, tzinfo=timezone.utc)
+            dt_end = dt_start + timedelta(days=1) - timedelta(milliseconds=1)
+            return int(dt_start.timestamp() * 1000), int(dt_end.timestamp() * 1000)
+
+        elif base_tf == "1h":
+            # filename like 2025-05.csv
+            y, m = without_ext.split("-")
+            dt_start = datetime(int(y), int(m), 1, 0, 0, tzinfo=timezone.utc)
+            # Jump to next month:
+            if int(m) == 12:
+                dt_next = datetime(int(y) + 1, 1, 1, 0, 0, tzinfo=timezone.utc)
+            else:
+                dt_next = datetime(int(y), int(m) + 1, 1, 0, 0, tzinfo=timezone.utc)
+            dt_end = dt_next - timedelta(milliseconds=1)
+            return int(dt_start.timestamp() * 1000), int(dt_end.timestamp() * 1000)
+
+        elif base_tf == "1D":
+            # filename like 2025.csv
+            y = without_ext
+            dt_start = datetime(int(y), 1, 1, 0, 0, tzinfo=timezone.utc)
+            dt_next = datetime(int(y) + 1, 1, 1, 0, 0, tzinfo=timezone.utc)
+            dt_end = dt_next - timedelta(milliseconds=1)
+            return int(dt_start.timestamp() * 1000), int(dt_end.timestamp() * 1000)
+
+        else:
+            # Default to day-based for safety
+            y, m, d = without_ext.split("-")
+            dt_start = datetime(int(y), int(m), int(d), 0, 0, tzinfo=timezone.utc)
+            dt_end = dt_start + timedelta(days=1) - timedelta(milliseconds=1)
+            return int(dt_start.timestamp() * 1000), int(dt_end.timestamp() * 1000)
+
     def _list_csv_files(self) -> List[str]:
         files = []
         base_tf = self.cfg.base_timeframe
@@ -656,25 +738,44 @@ class CandleIterator:
         regex_pat = pattern_map.get(base_tf, r"^\d{4}-\d{2}-\d{2}\.csv$")
         regex_obj = re.compile(regex_pat)
 
-        raw_files = [os.path.join(self.data_path, f) for f in os.listdir(self.data_path) if regex_obj.match(f)]
+        raw_files = [f for f in os.listdir(self.data_path) if regex_obj.match(f)]
 
-        def sort_key(path):
-            filename = os.path.basename(path)
+        def sort_key(filename):
             without_ext = filename.replace(".csv", "")
             parts = without_ext.split("-")
             if base_tf == "1m":
+                # yyyy-mm-dd
                 y, m, d = parts
                 return (int(y), int(m), int(d))
             elif base_tf == "1h":
+                # yyyy-mm
                 y, m = parts
                 return (int(y), int(m))
             elif base_tf == "1D":
+                # yyyy
                 return (int(without_ext), 0, 0)
             else:
                 return without_ext
 
         raw_files.sort(key=sort_key)
-        return raw_files
+
+        # Skip files outside [start_ts, end_ts]
+        selected_files = []
+        for f in raw_files:
+            fullpath = os.path.join(self.data_path, f)
+            f_start, f_end = self._file_day_range(f)
+
+            # If entire file is before our start_ts, skip
+            if self.cfg.start_ts and f_end < self.cfg.start_ts:
+                continue
+
+            # If entire file is beyond our end_ts, skip
+            if self.cfg.end_ts and f_start > self.cfg.end_ts:
+                break
+
+            selected_files.append(fullpath)
+
+        return selected_files
 
     def _load_candles_from_disk(self) -> Iterator[Tuple[int, float, float, float, float, float]]:
         """
@@ -764,7 +865,7 @@ def create_candle_iterator(
 
         if verbose:
             print(f"{INFO} No start date supplied. Using {required_base_bars} base-bars "
-                  f"({base_timeframe}) to cover 200 bars at highest TF: {largest_tf}")
+                  f"({base_timeframe}) to cover ~200 bars at highest TF: {largest_tf}")
 
         if end_ts is None:
             end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
