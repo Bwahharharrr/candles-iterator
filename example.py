@@ -9,6 +9,8 @@ import sys
 from datetime import datetime, timezone
 from candle_iterator import create_candle_iterator, TIMEFRAMES
 from candle_iterator.candle_iterator import Fore, Style, INFO, ERROR, COLOR_VAR, COLOR_TYPE, COLOR_REQ, COLOR_DESC, COLOR_FILE
+from candles_sync.candles_sync import synchronize_candle_data
+
 
 def parse_args():
     """Parse command line arguments"""
@@ -74,6 +76,17 @@ def main():
     print(f"  {COLOR_VAR}--data-dir{Style.RESET_ALL}         {COLOR_TYPE}(str){Style.RESET_ALL}  {args.data_dir}")
     print(f"  {COLOR_VAR}--verbose{Style.RESET_ALL}          {COLOR_TYPE}(bool){Style.RESET_ALL} {args.verbose}")
     print(f"\n{INFO} Starting candle iterator...\n")
+
+#'    ok = synchronize_candle_data(
+#'        exchange=args.exchange,
+#'        ticker=args.ticker,
+#'        timeframe=args.timeframe,
+#'        end_date_str=args.end,
+#'        verbose=True
+#'    )
+#'    if not ok:
+#'        print(f"\n{ERROR} Synchronization failed for {tf}.\n")
+#'        sys.exit(1)
 
     try:
         for closure in create_candle_iterator(

@@ -47,12 +47,10 @@ COLOR_TYPE = Fore.YELLOW
 COLOR_DESC = Fore.MAGENTA
 COLOR_REQ = Fore.RED + "[REQUIRED]" + Style.RESET_ALL
 
-
 # ----------------------------------------------------------------------
 # 2) LOCAL IMPORT: SYNCHRONIZE FUNCTION
 # ----------------------------------------------------------------------
 from candles_sync import synchronize_candle_data
-
 
 # ----------------------------------------------------------------------
 # 3) TIMEFRAME DEFINITIONS
@@ -154,8 +152,8 @@ class Candle:
 class CandleClosure:
     """
     A closure event from aggregator_manager, containing:
-      - closed_candles: the last fully closed candle for each timeframe
-      - open_candles: the partial candle for each higher timeframe still open
+      - closed_candles: the last fully closed candle(s) for each timeframe
+      - open_candles: partial candle(s) still open
     """
     timestamp: int
     closed_candles: Dict[str, Candle] = field(default_factory=dict)
@@ -179,15 +177,13 @@ class CandleClosure:
 
     def print(self):
         dt_str = self.datetime.strftime("%Y-%m-%d %H:%M")
-        print(f"{Fore.YELLOW}[Closure]{Style.RESET_ALL} T={self.timestamp} {dt_str} "
-              f"=> Timeframes in snapshot: {', '.join(self.timeframes)}")
-        # Closed Candles title in green
+        print(f"{Fore.YELLOW}[Closure]{Style.RESET_ALL} T={self.timestamp} {dt_str} => "
+              f"Timeframes in snapshot: {', '.join(self.timeframes)}")
         print(f"{Fore.GREEN}  Closed Candles:{Style.RESET_ALL}")
         for tf in sorted(self.closed_candles.keys(), key=lambda x: TIMEFRAMES[x]):
             print(f"    - {self.closed_candles[tf]}")
 
         if self.open_candles:
-            # Open Candles title in red
             print(f"{Fore.RED}  Open Candles (partial):{Style.RESET_ALL}")
             for tf in sorted(self.open_candles.keys(), key=lambda x: TIMEFRAMES[x]):
                 print(f"    - {self.open_candles[tf]}")
@@ -198,12 +194,12 @@ class CandleClosure:
 # ----------------------------------------------------------------------
 class CandleAggregator:
     """
-    Aggregator for a single timeframe.
-
-    - If is_base=True, each CSV row is immediately treated as a closed candle (no accumulation).
-    - If is_base=False, we accumulate sub_count base candles, or we fill zero-volume candles for missing periods.
+    Aggregator for one timeframe.
+    - If is_base=True, we treat incoming subcandles as partial real-time data. 
+      We finalize them only if they are definitely behind us or the next row jumps forward.
+    - If is_base=False, we accumulate a certain number of subcandles (sub_factor),
+      or fill zero-volume for missing intervals, etc.
     """
-
     def __init__(self, timeframe: str, is_base=False, sub_factor=1):
         self.tf = timeframe
         self.tf_ms = TIMEFRAMES[timeframe]
@@ -224,42 +220,27 @@ class CandleAggregator:
         self.last_sub_ts = None
 
     def on_base_csv_row(self, ts, o, h, l, c, v):
-        """
-        For base aggregator, finalize the row as a closed candle with the row's real OHLCV.
-        """
         if not self.is_base:
-            raise RuntimeError("Called on_base_csv_row() on a non-base aggregator?")
+            raise RuntimeError("Called on_base_csv_row() on a non-base aggregator? (bug)")
 
-        aggregator_manager.record_closure(
-            aggregator_closure_ts=ts,
-            tf=self.tf,
-            label_ts=ts,
-            o=o, h=h, l=l, c=c, vol=v
-        )
-        self.last_sub_ts = ts
+        self._accumulate_base_subcandle(ts, o, h, l, c, v)
 
-    def on_base_candle_closed(self, base_ts, o, h, l, c, v):
-        """
-        For higher aggregator. Accumulate subcandles. If we jump multiple aggregator boundaries => produce zero candles.
-        """
-        if self.is_base:
-            raise RuntimeError("Base aggregator called on_base_candle_closed?")
+    def _accumulate_base_subcandle(self, base_ts, o, h, l, c, v):
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
         if self.current_boundary is None:
-            aligned = (base_ts // self.tf_ms) * self.tf_ms
-            self.current_boundary = aligned
+            self.current_boundary = (base_ts // self.tf_ms) * self.tf_ms
 
-        # If we jumped multiple boundaries
+        # If new row's time is beyond the boundary by >= 1 TF => finalize old candle
         while self.current_boundary + self.tf_ms <= base_ts:
             if self.sub_count > 0:
                 self._finalize_aggregator_candle(real_event_ts=self.last_sub_ts or self.current_boundary)
             else:
-                self._record_zero_candle(real_event_ts=self.last_sub_ts or self.current_boundary)
-
+                self._record_zero_candle(real_event_ts=self.current_boundary)
             self.current_boundary += self.tf_ms
             self.reset()
 
-        # If not already open, initialize aggregator candle
+        # Initialize aggregator candle if empty
         if self.open_ts is None:
             self.open_ts = self.current_boundary
             self.open_px = o
@@ -269,7 +250,6 @@ class CandleAggregator:
             self.volume = 0.0
             self.sub_count = 0
 
-        # Accumulate
         self.high_px = max(self.high_px, h)
         self.low_px = min(self.low_px, l)
         self.close_px = c
@@ -277,16 +257,57 @@ class CandleAggregator:
         self.sub_count += 1
         self.last_sub_ts = base_ts
 
-        # finalize if sub_count >= sub_factor
-        if self.sub_count >= self.sub_factor:
+        # If we are behind the boundary => finalize
+        fully_behind_now = (base_ts + self.tf_ms <= now_ms)
+        if (base_ts > (self.current_boundary + self.tf_ms - 1)) or fully_behind_now:
             self._finalize_aggregator_candle(real_event_ts=base_ts)
             self.current_boundary += self.tf_ms
             self.reset()
 
+    def on_base_candle_closed(self, base_ts, o, h, l, c, v):
+        """
+        For higher timeframes. Each base candle is a subcandle. Once we accumulate sub_factor or jump forward, finalize.
+        """
+        if self.is_base:
+            raise RuntimeError("Base aggregator called on_base_candle_closed? (bug)")
+
+        if self.current_boundary is None:
+            aligned = (base_ts // self.tf_ms) * self.tf_ms
+            self.current_boundary = aligned
+
+        # If we jumped multiple intervals
+        while self.current_boundary + self.tf_ms < base_ts:
+            if self.sub_count > 0:
+                self._finalize_aggregator_candle(real_event_ts=self.last_sub_ts or self.current_boundary)
+            else:
+                self._record_zero_candle(real_event_ts=self.last_sub_ts or self.current_boundary)
+            self.current_boundary += self.tf_ms
+            self.reset()
+
+        if self.open_ts is None:
+            self.open_ts = self.current_boundary
+            self.open_px = o
+            self.high_px = o
+            self.low_px = o
+            self.close_px = o
+            self.volume = 0.0
+            self.sub_count = 0
+
+        self.high_px = max(self.high_px, h)
+        self.low_px = min(self.low_px, l)
+        self.close_px = c
+        self.volume += v
+        self.sub_count += 1
+        self.last_sub_ts = base_ts
+
+        # finalize if sub_count >= sub_factor and we passed boundary
+        if self.sub_count >= self.sub_factor:
+            if base_ts > self.current_boundary + self.tf_ms - 1:
+                self._finalize_aggregator_candle(real_event_ts=base_ts)
+                self.current_boundary += self.tf_ms
+                self.reset()
+
     def _record_zero_candle(self, real_event_ts):
-        """
-        Creates a zero-volume candle at the aggregator boundary.
-        """
         aggregator_manager.record_closure(
             aggregator_closure_ts=real_event_ts,
             tf=self.tf,
@@ -296,15 +317,18 @@ class CandleAggregator:
         )
 
     def _finalize_aggregator_candle(self, real_event_ts):
-        """
-        Finalize aggregator candle from current open state.
-        """
-        if aggregator_manager.verbose:
-            print(f"{Fore.MAGENTA}[DEBUG]{Style.RESET_ALL} aggregator {self.tf} FINALIZING => boundary={self.current_boundary}, o={self.open_px},h={self.high_px},l={self.low_px},c={self.close_px},vol={self.volume}")
+        if self.open_ts is None:
+            return
+        if aggregator_manager and aggregator_manager.verbose:
+            print(
+                f"{Fore.MAGENTA}[DEBUG]{Style.RESET_ALL} aggregator {self.tf} FINALIZING => "
+                f"boundary={self.current_boundary}, "
+                f"o={self.open_px},h={self.high_px},l={self.low_px},c={self.close_px},vol={self.volume}"
+            )
         aggregator_manager.record_closure(
             aggregator_closure_ts=real_event_ts,
             tf=self.tf,
-            label_ts=self.current_boundary,
+            label_ts=self.open_ts,
             o=self.open_px,
             h=self.high_px,
             l=self.low_px,
@@ -313,8 +337,7 @@ class CandleAggregator:
         )
 
     def get_current_open_candle(self) -> Optional[Candle]:
-        """Returns the partial aggregator candle, if not finalized."""
-        if self.is_base or self.open_ts is None:
+        if self.open_ts is None:
             return None
         return Candle(
             timeframe=self.tf,
@@ -332,7 +355,7 @@ class CandleAggregator:
 # ----------------------------------------------------------------------
 class AggregatorManager:
     """
-    Manages the base aggregator plus higher aggregator(s).
+    Manages a base aggregator plus any higher aggregators.
     """
     def __init__(self, base_tf: str, higher_tfs: List[str], verbose: bool = False):
         self.verbose = verbose
@@ -350,24 +373,34 @@ class AggregatorManager:
         self.pending_closures: Dict[int, set] = {}
         self._all_timeframes = [self.base_tf] + higher_tfs
 
+        # Ensure we only produce final partial closure once
+        self._final_partial_emitted = False
+
     def record_closure(self, aggregator_closure_ts, tf, label_ts, o, h, l, c, vol):
-        """Called by aggregator whenever it finalizes a candle."""
+        """
+        Called by aggregator to record a newly finalized candle.
+        If tf == base_tf, that candle is also fed to each higher aggregator.
+        """
         if tf == self.base_tf:
-            # forward to higher aggregator
             for agg in self.higher_aggs:
                 agg.on_base_candle_closed(aggregator_closure_ts, o, h, l, c, vol)
 
         self.latest_closed_candles[tf] = (tf, label_ts, o, h, l, c, vol)
-
         if aggregator_closure_ts not in self.pending_closures:
             self.pending_closures[aggregator_closure_ts] = set()
         self.pending_closures[aggregator_closure_ts].add(tf)
 
     def on_subcandle(self, ts, o, h, l, c, v) -> List[CandleClosure]:
+        """
+        Called for each row of base timeframe data.
+        """
+        # We clear old closures from the prior subcandle
         self.pending_closures.clear()
-        closures = self.base_agg.on_base_csv_row(ts, o, h, l, c, v)
-        # 'on_base_csv_row' returns None, so 'closures' is always None here.
-        # The real closures are recorded in self.pending_closures, so we build them below.
+
+        # Feed it into the base aggregator
+        self.base_agg.on_base_csv_row(ts, o, h, l, c, v)
+
+        # Build closures for newly finalized candles
         return self._build_and_return_closures()
 
     def _build_and_return_closures(self) -> List[CandleClosure]:
@@ -388,6 +421,10 @@ class AggregatorManager:
                 if oc:
                     open_candles[agg.tf] = oc
 
+            base_open = self.base_agg.get_current_open_candle()
+            if base_open:
+                open_candles[self.base_tf] = base_open
+
             cc = CandleClosure(
                 timestamp=closure_ts,
                 closed_candles=closed_candles,
@@ -400,30 +437,69 @@ class AggregatorManager:
 
     def flush(self) -> List[CandleClosure]:
         """
-        Called at iteration end => forcibly finalize or skip partial aggregator candles.
+        Called when no more data rows are available. We forcibly finalize behind-candles,
+        and (once only) produce a final partial closure if any aggregator is still open.
         """
+        # Possibly finalize the base aggregator if it's truly behind now
+        if self.base_agg.open_ts is not None:
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            if self.base_agg.open_ts + self.base_agg.tf_ms <= now_ms:
+                if self.verbose:
+                    print(f"{Fore.MAGENTA}[DEBUG]{Style.RESET_ALL} forcibly finalizing base aggregator partial.")
+                self.base_agg._finalize_aggregator_candle(real_event_ts=self.base_agg.last_sub_ts)
+                self.base_agg.current_boundary += self.base_agg.tf_ms
+                self.base_agg.reset()
+
+        # Do the same for higher aggregators
         for agg in self.higher_aggs:
             if agg.open_ts is not None:
                 if agg.sub_count >= agg.sub_factor:
-                    real_ts = agg.last_sub_ts or agg.current_boundary
-                    if self.verbose:
-                        print(f"{Fore.MAGENTA}[DEBUG]{Style.RESET_ALL} aggregator {agg.tf} forcibly finalizing partial => sub_count={agg.sub_count}")
-                    agg._finalize_aggregator_candle(real_event_ts=real_ts)
-                else:
-                    if self.verbose:
-                        print(
-                            f"{Fore.YELLOW}[DEBUG]{Style.RESET_ALL} aggregator {agg.tf} skipping partial flush => "
-                            f"sub_count={agg.sub_count}/{agg.sub_factor}"
-                        )
-                if agg.current_boundary is not None:
-                    agg.current_boundary += agg.tf_ms
-                agg.reset()
+                    if (agg.last_sub_ts or 0) > (agg.current_boundary + agg.tf_ms - 1):
+                        if self.verbose:
+                            print(
+                                f"{Fore.MAGENTA}[DEBUG]{Style.RESET_ALL} aggregator {agg.tf} forcibly finalizing partial => "
+                                f"sub_count={agg.sub_count}"
+                            )
+                        agg._finalize_aggregator_candle(real_event_ts=agg.last_sub_ts)
+                        agg.current_boundary += agg.tf_ms
+                        agg.reset()
 
+        # Grab closures from that forced finalization
+        out = []
         if self.pending_closures:
             closures = self._build_and_return_closures()
             self.pending_closures.clear()
-            return closures
-        return []
+            out.extend(closures)
+
+        # Produce final partial closure exactly once, if needed
+        if not self._final_partial_emitted:
+            partial_open_candles = {}
+            earliest_open_ts = None
+
+            all_aggs = [self.base_agg] + self.higher_aggs
+            for aggregator in all_aggs:
+                oc = aggregator.get_current_open_candle()
+                if oc:
+                    partial_open_candles[aggregator.tf] = oc
+                    if earliest_open_ts is None or oc.timestamp < earliest_open_ts:
+                        earliest_open_ts = oc.timestamp
+
+            if partial_open_candles and earliest_open_ts is not None:
+                cc = CandleClosure(
+                    timestamp=earliest_open_ts,
+                    closed_candles={},
+                    open_candles=partial_open_candles,
+                    last_closed=None
+                )
+                out.append(cc)
+
+                # IMPORTANT: reset all aggregators so they don't keep re-reporting partial
+                for aggregator in all_aggs:
+                    aggregator.reset()
+
+            self._final_partial_emitted = True
+
+        return out
 
 
 aggregator_manager = None
@@ -460,173 +536,191 @@ class Config:
 # ----------------------------------------------------------------------
 class CandleIterator:
     """
-    Reads CSV data day-by-day. For each real row => aggregator_manager.on_subcandle(...).
-    If a gap is found, produce exactly one gap candle, yield aggregator closures, then repeat.
-    Adds debug so you can see if the row is being used or skipped.
+    Iterates over base timeframe candles, returning CandleClosure objects.
+    We fill missing steps with zero-volume candles, then call `flush()` at the end
+    to produce any final partial closure exactly once.
     """
 
-    def __init__(self, config: Config):
-        self.config = config
-        self.current_day = datetime.fromtimestamp(config.start_ts / 1000, tz=timezone.utc)
-        self.buffer: List[CandleClosure] = []
-        self.current_rows = None
-        self.current_row_index = 0
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.data_path = os.path.expanduser(
+            f"{cfg.data_dir}/{cfg.exchange}/candles/{cfg.ticker}/{cfg.base_timeframe}"
+        )
+        if not os.path.isdir(self.data_path):
+            raise ValueError(f"Data directory not found: {self.data_path}")
 
-        self._last_closure: Optional[CandleClosure] = None
-        self.last_ts: Optional[int] = None
-        self.last_close_val: Optional[float] = None
+        self.csv_file_paths = self._list_csv_files()
+        if self.cfg.verbose:
+            print(f"{INFO} Found {len(self.csv_file_paths)} data files for base timeframe: {self.cfg.base_timeframe}")
 
-        if self.config.verbose:
-            print(f"Iterator initialized: start={self.current_day}, "
-                  f"end={'No end date' if config.end_ts is None else datetime.fromtimestamp(config.end_ts / 1000, tz=timezone.utc)}")
+        self._candles_gen = self._load_candles_from_disk()
+        self._closed_buffer: List[CandleClosure] = []
+        self._current_row = None
+        self._last_ts = None
+        self._last_close = None
 
-    def process_row(self, row):
-        try:
-            raw_ts = int(row["timestamp"])
-            if self.config.verbose:
-                print(f"{Fore.CYAN}[DEBUG]{Style.RESET_ALL} Checking row: timestamp={raw_ts}, row={row}")
-            if raw_ts < self.config.start_ts:
-                if self.config.verbose:
-                    print(f"{Fore.CYAN}[DEBUG]{Style.RESET_ALL} => row timestamp < start_ts, skipping.")
-                return None
-            elif self.config.end_ts is not None and raw_ts > self.config.end_ts:
-                if self.config.verbose:
-                    print(f"{Fore.CYAN}[DEBUG]{Style.RESET_ALL} => row timestamp > end_ts, skipping.")
-                return None
-            else:
-                if self.config.verbose:
-                    print(f"--- {Fore.CYAN}[DEBUG]{Style.RESET_ALL} Checking row: timestamp={raw_ts}, row={row}")
+        self.base_ms = TIMEFRAMES[self.cfg.base_timeframe]
 
-            o = float(row["open"])
-            h = float(row["high"])
-            l = float(row["low"])
-            c = float(row["close"])
-            v = float(row["volume"])
-            return (raw_ts, o, h, l, c, v)
-        except (ValueError, KeyError) as e:
-            print(f"Error processing row: {row}, Error: {e}")
-            return None
-
-    def load_next_file(self) -> bool:
-        if self.config.end_ts is not None:
-            end_date = datetime.fromtimestamp(self.config.end_ts/1000, tz=timezone.utc).date()
-        else:
-            end_date = datetime.now(timezone.utc).date()
-
-        if self.current_day.date() > end_date:
-            if self.config.verbose:
-                print(f"Past end date: {self.current_day.date()} > {end_date}")
-            return False
-
-        while self.current_day.date() <= end_date:
-            csv_path = os.path.join(
-                os.path.expanduser(f"{self.config.data_dir}/{self.config.exchange}/candles/{self.config.ticker}/{self.config.base_timeframe}"),
-                f"{self.current_day.date()}.csv"
-            )
-            cd = self.current_day.date()
-            self.current_day += timedelta(days=1)
-
-            if os.path.isfile(csv_path):
-                with open(csv_path, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    self.current_rows = sorted(reader, key=lambda r: int(r["timestamp"]))
-                    self.current_row_index = 0
-                    if self.config.verbose:
-                        print(f"Loaded file: {csv_path} with {len(self.current_rows)} rows")
-                return True
-            else:
-                if self.config.verbose:
-                    print(f"File not found: {csv_path} (date={cd})")
-
-        if self.config.verbose:
-            print(f"No more files to process. Current day {self.current_day.date()} > end date {end_date}")
-        return False
-
-    def _emit_base_candle(self, ts, o, h, l, c, v, is_gap=False):
-        """
-        Feed one base candle => aggregator => store closures in buffer.
-        If is_gap=True, we log additional debug info.
-        """
-        if self.config.verbose:
-            if is_gap:
-                print(f"{Fore.GREEN}[GAP-FILL]{Style.RESET_ALL} Emitting gap candle at ts={ts} with close={c} volume=0.0")
-            else:
-                print(f"{Fore.GREEN}[REAL]{Style.RESET_ALL} Emitting real candle at ts={ts} o={o},h={h},l={l},c={c},v={v}")
-
-        new_closures = aggregator_manager.on_subcandle(ts, o, h, l, c, v)
-        if new_closures:
-            self.buffer.extend(new_closures)
-
-    def __iter__(self):
+    def __iter__(self) -> Iterator[CandleClosure]:
         return self
 
     def __next__(self) -> CandleClosure:
         global aggregator_manager
 
-        # If we already have closures buffered, return them first
-        if self.buffer:
-            cc = self.buffer.pop(0)
-            cc.last_closed = self._last_closure
-            self._last_closure = cc
-            return cc
+        # If we have buffered closures, return from that buffer
+        if self._closed_buffer:
+            return self._closed_buffer.pop(0)
 
         while True:
-            if self.current_rows is None or self.current_row_index >= len(self.current_rows):
-                if not self.load_next_file():
-                    # final flush
-                    flushes = aggregator_manager.flush()
-                    if flushes:
-                        self.buffer.extend(flushes)
-                        cc = self.buffer.pop(0)
-                        cc.last_closed = self._last_closure
-                        self._last_closure = cc
-                        return cc
+            if self._current_row:
+                row_ts, o, h, l, c, v = self._current_row
+                self._current_row = None
+            else:
+                # Fetch next candle row from CSV
+                try:
+                    row_ts, o, h, l, c, v = next(self._candles_gen)
+                except StopIteration:
+                    # No more real rows => flush aggregator once
+                    flush_closures = aggregator_manager.flush()
+                    if flush_closures:
+                        self._closed_buffer.extend(flush_closures)
+                        return self._closed_buffer.pop(0)
+                    else:
+                        raise StopIteration
+
+            if self._last_ts is None:
+                self._last_ts = row_ts
+                self._last_close = o
+                if self.cfg.end_ts and row_ts > self.cfg.end_ts:
                     raise StopIteration
 
-            # process next row
-            if self.current_row_index < len(self.current_rows):
-                row = self.current_rows[self.current_row_index]
-                self.current_row_index += 1
+            # If there's a gap > one base step => fill missing candle
+            if row_ts > self._last_ts + self.base_ms:
+                missing_ts = self._last_ts + self.base_ms
+                if self.cfg.end_ts and missing_ts > self.cfg.end_ts:
+                    raise StopIteration
 
-                parsed = self.process_row(row)
-                if parsed is None:
+                if self.cfg.verbose:
+                    dt_str = datetime.fromtimestamp(missing_ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                    print(f"{Fore.RED}[MISSING]{Style.RESET_ALL} Candle missing at {missing_ts} ({dt_str}) => generating fake candle (0 volume)")
+
+                dummy_o = dummy_h = dummy_l = dummy_c = self._last_close
+                dummy_v = 0.0
+
+                new_closures = aggregator_manager.on_subcandle(missing_ts, dummy_o, dummy_h, dummy_l, dummy_c, dummy_v)
+                self._closed_buffer.extend(new_closures)
+
+                self._last_ts = missing_ts
+                self._last_close = dummy_c
+                self._current_row = (row_ts, o, h, l, c, v)
+
+                if self._closed_buffer:
+                    return self._closed_buffer.pop(0)
+                else:
                     continue
 
-                ts, o, h, l, c, v = parsed
-                base_ms = TIMEFRAMES[self.config.base_timeframe]
+            if self.cfg.end_ts and row_ts > self.cfg.end_ts:
+                # Past end, flush aggregator
+                flush_closures = aggregator_manager.flush()
+                if flush_closures:
+                    self._closed_buffer.extend(flush_closures)
+                    return self._closed_buffer.pop(0)
+                else:
+                    raise StopIteration
 
-                # check for gap
-                if self.last_ts is not None:
-                    next_expected = self.last_ts + base_ms
-                    if next_expected < ts:
-                        # produce single gap candle
-                        fill_price = self.last_close_val if self.last_close_val is not None else c
-                        self._emit_base_candle(next_expected, fill_price, fill_price, fill_price, fill_price, 0.0, is_gap=True)
-                        self.last_ts = next_expected
-                        self.current_row_index -= 1
-                        if self.buffer:
-                            cc = self.buffer.pop(0)
-                            cc.last_closed = self._last_closure
-                            self._last_closure = cc
-                            return cc
-                        # re-check same row on next iteration
-                        continue
-
-                # no gap => real candle
-                self._emit_base_candle(ts, o, h, l, c, v, is_gap=False)
-                self.last_ts = ts
-                self.last_close_val = c
-
-                if self.buffer:
-                    cc = self.buffer.pop(0)
-                    cc.last_closed = self._last_closure
-                    self._last_closure = cc
-                    return cc
-            else:
-                # done with the file
+            if row_ts <= self._last_ts:
+                # Skip duplicates
+                if self.cfg.verbose:
+                    print(f"{WARNING} Skipping non-increasing timestamp: {row_ts}")
                 continue
 
+            # Normal row => feed aggregator
+            new_closures = aggregator_manager.on_subcandle(row_ts, o, h, l, c, v)
+            self._closed_buffer.extend(new_closures)
 
+            self._last_ts = row_ts
+            self._last_close = c
+
+            if self._closed_buffer:
+                return self._closed_buffer.pop(0)
+
+    def _list_csv_files(self) -> List[str]:
+        files = []
+        base_tf = self.cfg.base_timeframe
+
+        pattern_map = {
+            "1m":  r"^\d{4}-\d{2}-\d{2}\.csv$",
+            "1h":  r"^\d{4}-\d{2}\.csv$",
+            "1D":  r"^\d{4}\.csv$",
+        }
+        regex_pat = pattern_map.get(base_tf, r"^\d{4}-\d{2}-\d{2}\.csv$")
+        regex_obj = re.compile(regex_pat)
+
+        raw_files = [os.path.join(self.data_path, f) for f in os.listdir(self.data_path) if regex_obj.match(f)]
+
+        def sort_key(path):
+            filename = os.path.basename(path)
+            without_ext = filename.replace(".csv", "")
+            parts = without_ext.split("-")
+            if base_tf == "1m":
+                y, m, d = parts
+                return (int(y), int(m), int(d))
+            elif base_tf == "1h":
+                y, m = parts
+                return (int(y), int(m))
+            elif base_tf == "1D":
+                return (int(without_ext), 0, 0)
+            else:
+                return without_ext
+
+        raw_files.sort(key=sort_key)
+        return raw_files
+
+    def _load_candles_from_disk(self) -> Iterator[Tuple[int, float, float, float, float, float]]:
+        """
+        Reads CSV files in chronological order, yields (ts, open, high, low, close, volume).
+        Skips lines outside [start_ts, end_ts].
+        """
+        reached_end = False
+        for csv_path in self.csv_file_paths:
+            if reached_end:
+                break
+
+            if self.cfg.verbose:
+                print(f"{INFO} Reading file: {csv_path}")
+
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if reached_end:
+                        break
+                    if not row or len(row) < 6:
+                        continue
+                    if row[0].lower() == "timestamp":
+                        continue
+
+                    try:
+                        ts = int(row[0])
+                        o = float(row[1])
+                        h = float(row[2])
+                        l = float(row[3])
+                        c = float(row[4])
+                        v = float(row[5])
+                    except ValueError:
+                        continue
+
+                    if self.cfg.start_ts and ts < self.cfg.start_ts:
+                        continue
+                    if self.cfg.end_ts and ts > self.cfg.end_ts:
+                        reached_end = True
+                        break
+
+                    yield (ts, o, h, l, c, v)
+
+
+# ----------------------------------------------------------------------
+# create_candle_iterator
+# ----------------------------------------------------------------------
 def create_candle_iterator(
     exchange: str,
     ticker: str,
@@ -655,15 +749,29 @@ def create_candle_iterator(
                 f"Aggregation timeframe '{tf}' is smaller than base timeframe '{base_timeframe}'"
             )
 
+    # Ensure the base TF is in final list
     if base_timeframe not in parsed_tfs:
         parsed_tfs.insert(0, base_timeframe)
 
     start_ts = parse_timestamp(start_date, True)
     end_ts = parse_timestamp(end_date, False)
+
+    # If no start date, pick enough base candles to have ~200 bars at the largest TF
     if start_ts is None:
-        dt = datetime.now(timezone.utc) - timedelta(days=300)
-        dt_midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        start_ts = int(dt_midnight.timestamp() * 1000)
+        largest_tf = max(parsed_tfs, key=lambda x: TIMEFRAMES[x])
+        factor = TIMEFRAMES[largest_tf] // TIMEFRAMES[base_timeframe]
+        required_base_bars = 200 * factor
+
+        if verbose:
+            print(f"{INFO} No start date supplied. Using {required_base_bars} base-bars "
+                  f"({base_timeframe}) to cover 200 bars at highest TF: {largest_tf}")
+
+        if end_ts is None:
+            end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+            if verbose:
+                print(f"{INFO} No end date supplied. Using 'now' => {end_ts}.")
+
+        start_ts = end_ts - (required_base_bars * base_ms)
 
     global aggregator_manager
     higher_tfs = [t for t in parsed_tfs if t != base_timeframe]
@@ -679,19 +787,22 @@ def create_candle_iterator(
         verbose=verbose
     )
 
-    # Possibly sync data
+    # Possibly sync data first
     end_date_str = None
     if end_ts:
         end_dt = datetime.fromtimestamp(end_ts / 1000, timezone.utc)
         end_date_str = end_dt.strftime("%Y-%m-%d %H:%M")
 
-    synchronize_candle_data(
+    ok = synchronize_candle_data(
         exchange=exchange,
         ticker=ticker,
         timeframe=base_timeframe,
         end_date_str=end_date_str,
-        verbose=False
+        verbose=True
     )
+    if not ok:
+        print(f"\n{ERROR} Synchronization failed for {base_timeframe}.\n")
+        sys.exit(1)
 
     return CandleIterator(cfg)
 
