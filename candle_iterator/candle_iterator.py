@@ -159,6 +159,7 @@ class CandleClosure:
     closed_candles: Dict[str, Candle] = field(default_factory=dict)
     open_candles: Dict[str, Candle] = field(default_factory=dict)
     last_closed: Optional['CandleClosure'] = None
+    is_final: bool = False
 
     @property
     def datetime(self) -> datetime:
@@ -445,18 +446,15 @@ class AggregatorManager:
                 timestamp=closure_ts,
                 closed_candles=closed_candles,
                 open_candles=open_candles,
-                last_closed=None
+                last_closed=None,
+                is_final=False
             )
             out.append(cc)
 
         return out
 
     def flush(self) -> List[CandleClosure]:
-        """
-        Called when no more data rows are available. We forcibly finalize behind-candles,
-        and (once only) produce a final partial closure if any aggregator is still open.
-        """
-        # Possibly finalize the base aggregator if it's behind now
+        # Finalize base if behind
         if self.base_agg.open_ts is not None:
             now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             if self.base_agg.open_ts + self.base_agg.tf_ms <= now_ms:
@@ -465,58 +463,50 @@ class AggregatorManager:
                 self.base_agg._finalize_aggregator_candle(real_event_ts=self.base_agg.last_sub_ts)
                 self.base_agg.current_boundary += self.base_agg.tf_ms
                 self.base_agg.reset()
-
-        # Do the same for higher aggregators
+        # Finalize higher if enough subs
         for agg in self.higher_aggs:
-            if agg.open_ts is not None:
-                # If we have enough subcandles for a full candle, finalize:
-                if agg.sub_count >= agg.sub_factor:
-                    if self.verbose:
-                        print(
-                            f"{Fore.MAGENTA}[DEBUG]{Style.RESET_ALL} forcibly finalizing aggregator {agg.tf} => "
-                            f"sub_count={agg.sub_count}"
-                        )
-                    agg._finalize_aggregator_candle(real_event_ts=agg.last_sub_ts)
-                    agg.current_boundary += agg.tf_ms
-                    agg.reset()
-
-        # Grab closures from that forced finalization
+            if agg.open_ts is not None and agg.sub_count >= agg.sub_factor:
+                if self.verbose:
+                    print(f"{Fore.MAGENTA}[DEBUG]{Style.RESET_ALL} forcibly finalizing aggregator {agg.tf}")
+                agg._finalize_aggregator_candle(real_event_ts=agg.last_sub_ts)
+                agg.current_boundary += agg.tf_ms
+                agg.reset()
         out = []
+        # Emit any pending closures
         if self.pending_closures:
             closures = self._build_and_return_closures()
             self.pending_closures.clear()
             out.extend(closures)
-
-        # Produce final partial closure exactly once, if needed
+        # FINAL PARTIAL CLOSURE: use the latest open‐candle timestamp
         if not self._final_partial_emitted:
             partial_open_candles = {}
-            earliest_open_ts = None
-
+            latest_open_ts = None
             all_aggs = [self.base_agg] + self.higher_aggs
             for aggregator in all_aggs:
                 oc = aggregator.get_current_open_candle()
                 if oc:
                     partial_open_candles[aggregator.tf] = oc
-                    if earliest_open_ts is None or oc.timestamp < earliest_open_ts:
-                        earliest_open_ts = oc.timestamp
-
-            if partial_open_candles and earliest_open_ts is not None:
+                    if latest_open_ts is None or oc.timestamp > latest_open_ts:
+                        latest_open_ts = oc.timestamp
+            if partial_open_candles and latest_open_ts is not None:
+                # include last-known closed
+                final_closed_candles = {}
+                for tf in self._all_timeframes:
+                    if tf in self.latest_closed_candles:
+                        (tfid, lbl_ts, oo, hh, ll, cc, vv) = self.latest_closed_candles[tf]
+                        final_closed_candles[tf] = Candle(tfid, lbl_ts, oo, hh, ll, cc, vv)
                 cc = CandleClosure(
-                    timestamp=earliest_open_ts,
-                    closed_candles={},
+                    timestamp=latest_open_ts,
+                    closed_candles=final_closed_candles,
                     open_candles=partial_open_candles,
-                    last_closed=None
+                    last_closed=None,
+                    is_final=True
                 )
                 out.append(cc)
-
-                # IMPORTANT: reset all aggregators so they don't keep re-reporting partial
                 for aggregator in all_aggs:
                     aggregator.reset()
-
             self._final_partial_emitted = True
-
         return out
-
 
 aggregator_manager = None
 
@@ -911,3 +901,4 @@ def create_candle_iterator(
 if __name__ == "__main__":
     print(f"{ERROR} This module should not be run directly. Use example.py or your main script.")
     sys.exit(1)
+

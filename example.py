@@ -100,6 +100,8 @@ def main():
             verbose=args.verbose
         ):
             # Get current time in milliseconds to check if candles are closed
+            if closure.is_final:
+                print(f"{INFO} Final partial closure detected. Emitting final partial closure.")
             closure.print()
             pass 
 
