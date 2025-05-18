@@ -88,6 +88,8 @@ def main():
 #'        print(f"\n{ERROR} Synchronization failed for {tf}.\n")
 #'        sys.exit(1)
 
+    cnt = 0
+
     try:
         for closure in create_candle_iterator(
             exchange=args.exchange,
@@ -103,11 +105,15 @@ def main():
             if closure.is_final:
                 print(f"{INFO} Final partial closure detected. Emitting final partial closure.")
             closure.print()
+            cnt += 1
             pass 
 
     except ValueError as e:
         print(f"{ERROR} {e}")
         sys.exit(1)
+
+    print(f"{INFO} Total candles processed: {cnt}")
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()
