@@ -102,9 +102,20 @@ def main():
             verbose=args.verbose
         ):
             # Get current time in milliseconds to check if candles are closed
+
+            if cnt == 0:
+                closure.print()
+
             if closure.is_final:
                 print(f"{INFO} Final partial closure detected. Emitting final partial closure.")
-            closure.print()
+
+            # print(closure.printsmall())
+
+            for tf in aggregation_tfs:
+                candle = closure.get_candle(tf)
+                if candle == None:
+                    print(f"---->>> {ERROR}{tf} not in closure: {closure.printsmall()}")
+
             cnt += 1
             pass 
 

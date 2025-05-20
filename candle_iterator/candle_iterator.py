@@ -176,6 +176,14 @@ class CandleClosure:
         else:
             return self.open_candles.get(timeframe)
 
+    def printsmall(self):
+        dt_str = self.datetime.strftime("%Y-%m-%d %H:%M")
+        closed_tfs = ','.join(sorted(self.closed_candles.keys()))
+        open_tfs = ','.join(sorted(self.open_candles.keys()))
+        return (f"[Closure] T={self.timestamp} {dt_str} | "
+                f"Closed: [{closed_tfs}] | Open: [{open_tfs}] | Final: {self.is_final}")
+
+
     def print(self):
         dt_str = self.datetime.strftime("%Y-%m-%d %H:%M")
         print(f"{Fore.YELLOW}[Closure]{Style.RESET_ALL} T={self.timestamp} {dt_str} => "
@@ -591,11 +599,10 @@ class CandleIterator:
                         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                         current_minute_boundary = (now_ms // self.base_ms) * self.base_ms
 
-                        # We fill for each minute up to and including the current minute boundary
+                        # fill up to current_minute_boundary
                         dummy_price = self._last_close
                         next_ts = self._last_ts + self.base_ms
 
-                        # === FIX / CHANGE: fill up to current_minute_boundary (not one minute before)
                         while next_ts <= current_minute_boundary:
                             if self.cfg.verbose:
                                 dt_str = datetime.fromtimestamp(next_ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -816,17 +823,34 @@ def create_candle_iterator(
     start_ts = parse_timestamp(start_date, True)
     end_ts = parse_timestamp(end_date, False)
 
+    # ----------------------------------------------------------------------
+    # FIX / IMPROVEMENT:
+    # 1) Identify the highest timeframe.
+    # 2) Compute 200 bars back from 'end_ts' in that timeframe.
+    # 3) Align 'start_ts' to the boundary of that highest timeframe.
+    # 4) Only do this if 'start_ts' was not supplied by the user.
+    # ----------------------------------------------------------------------
     if start_ts is None:
         largest_tf = max(parsed_tfs, key=lambda x: TIMEFRAMES[x])
-        factor = TIMEFRAMES[largest_tf] // TIMEFRAMES[base_timeframe]
-        if verbose:
-            print(f"{INFO} No start date supplied. Using {200 * factor} base-bars "
-                  f"({base_timeframe}) to cover ~200 bars at highest TF: {largest_tf}")
+        largest_tf_ms = TIMEFRAMES[largest_tf]
+
         if end_ts is None:
+            # If still no end_ts, assume 'now'.
             end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
             if verbose:
                 print(f"{INFO} No end date supplied. Using 'now' => {end_ts}.")
-        start_ts = end_ts - (200 * factor * base_ms)
+
+        # We go 200 candles back in the largest timeframe
+        raw_start_ts = end_ts - (200 * largest_tf_ms)
+
+        # Align to largest_tf boundary
+        aligned_start_ts = (raw_start_ts // largest_tf_ms) * largest_tf_ms
+
+        start_ts = aligned_start_ts
+
+        if verbose:
+            print(f"{INFO} No start date supplied. Using highest timeframe '{largest_tf}' ("
+                  f"{largest_tf_ms} ms) and 200 bars => raw start = {raw_start_ts}, aligned to {aligned_start_ts}.")
 
     global aggregator_manager
     higher_tfs = [t for t in parsed_tfs if t != base_timeframe]
