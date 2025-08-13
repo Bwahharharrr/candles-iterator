@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "candle_iterator"
+version = "0.1.0"
+description = "A tool for analyzing candle data across multiple timeframes"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Bwahharharrr", email = "your.email@example.com" }]
+keywords = ["trading", "candles", "analysis", "crypto"]
+dependencies = [
+  "colorama",
+  "numpy",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Financial and Insurance Industry",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/Bwahharharrr/candle_iterator"
+Source = "https://github.com/Bwahharharrr/candle_iterator"
+
+[project.scripts]
+candle-iterator = "candle_iterator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["candle_iterator*"]
+exclude = ["tests*", "docs*"]
+namespaces = false
+
