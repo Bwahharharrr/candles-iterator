@@ -190,8 +190,9 @@ class CandleClosure:
 
     def print(self):
         dt_str = self.datetime.strftime("%Y-%m-%d %H:%M")
-        print(f"{Fore.YELLOW}[Closure]{Style.RESET_ALL} T={self.timestamp} {dt_str} => "
-              f"Timeframes in snapshot: {', '.join(self.timeframes)}")
+        now_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{Fore.YELLOW}[Closure - {now_utc_str}]{Style.RESET_ALL} "
+            f"T={self.timestamp} {dt_str} => Timeframes in snapshot: {', '.join(self.timeframes)}")
         print(f"{Fore.GREEN}  Closed Candles:{Style.RESET_ALL}")
         for tf in sorted(self.closed_candles.keys(), key=lambda x: TIMEFRAMES[x]):
             print(f"    - {self.closed_candles[tf]}")
@@ -480,9 +481,6 @@ class CandleAggregator:
 # ----------------------------------------------------------------------
 # AggregatorManager
 # ----------------------------------------------------------------------
-# ----------------------------------------------------------------------
-# AggregatorManager
-# ----------------------------------------------------------------------
 class AggregatorManager:
     """
     Manages a base aggregator plus any higher aggregators.
@@ -511,6 +509,10 @@ class AggregatorManager:
 
         self._all_timeframes = [self.base_tf] + higher_tfs
         self._final_partial_emitted = False  # used only for finite-range mode
+
+        # Timing diagnostics toggle
+        self.debug_timing: bool = self._truthy_env(os.environ.get("CANDLES_SYNC_DEBUG_TIMING")) or bool(self.verbose)
+        self._timing_prefix = Fore.CYAN + "[TIMING]" + Style.RESET_ALL
 
     # ---------- Public snapshot utilities ----------
     def preferred_snapshot_ts(self) -> Optional[int]:
@@ -557,6 +559,12 @@ class AggregatorManager:
     # ---------- Ingestion ----------
     def record_closure(self, aggregator_closure_ts: int, tf: str, label_ts: int,
                        o: float, h: float, l: float, c: float, vol: float) -> None:
+        """
+        Called by CandleAggregator when a timeframe closes (or a zero candle recorded).
+        Timing note: this is the earliest moment a closure becomes 'pending'.
+        """
+        t0 = time.perf_counter()
+
         if tf == self.base_tf:
             for agg in self.higher_aggs:
                 agg.on_base_candle_closed(aggregator_closure_ts, o, h, l, c, vol)
@@ -571,6 +579,15 @@ class AggregatorManager:
             self.pending_closures[aggregator_closure_ts] = set()
         self.pending_closures[aggregator_closure_ts].add(tf)
 
+        if self.debug_timing:
+            dt_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            pend_count = sum(len(s) for s in self.pending_closures.values())
+            print(
+                f"{self._timing_prefix} {dt_str} record_closure tf={tf} label_ts={label_ts} "
+                f"event_ts={aggregator_closure_ts} pending_tf_count={pend_count} "
+                f"handler_s={(time.perf_counter()-t0):.6f}"
+            )
+
     def on_subcandle(self, ts: int, o: float, h: float, l: float, c: float, v: float) -> List[CandleClosure]:
         # Feed into base
         self.base_agg.on_base_csv_row(ts, o, h, l, c, v)
@@ -580,7 +597,10 @@ class AggregatorManager:
             for agg in self.higher_aggs:
                 agg.on_base_partial(ts, o, h, l, c, v)
 
-        return self._build_and_return_closures(snapshot_event_ts=ts)
+        # IMPORTANT FIX: During ingestion we do NOT emit snapshots.
+        # Only return real finalized closures here; the iterator will request
+        # a heartbeat snapshot explicitly when no closures were produced.
+        return self._build_and_return_closures(snapshot_event_ts=None)
 
     # ---------- Internal: build closures ----------
     def _compose_closed_snapshot_for_ts(self, closure_ts: int) -> Dict[str, Candle]:
@@ -627,10 +647,12 @@ class AggregatorManager:
         return [cc]
 
     def _build_and_return_closures(self, snapshot_event_ts: Optional[int] = None) -> List[CandleClosure]:
+        t0 = time.perf_counter()
         out: List[CandleClosure] = []
 
         if self.pending_closures:
-            for closure_ts in sorted(self.pending_closures.keys()):
+            pending_items = sorted(self.pending_closures.keys())
+            for closure_ts in pending_items:
                 closed_candles = self._compose_closed_snapshot_for_ts(closure_ts)
 
                 open_candles: Dict[str, Candle] = {}
@@ -653,9 +675,24 @@ class AggregatorManager:
 
             self.pending_closures.clear()
             self._closed_by_ts.clear()
+
+            if self.debug_timing:
+                dt_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                print(
+                    f"{self._timing_prefix} {dt_str} build_and_return_closures "
+                    f"count={len(out)} elapsed_s={(time.perf_counter()-t0):.6f}"
+                )
             return out
 
-        return self._build_snapshot_closure(snapshot_event_ts)
+        # No finalized closures -> optionally build a snapshot (callers decide).
+        out2 = self._build_snapshot_closure(snapshot_event_ts)
+        if self.debug_timing and out2:
+            dt_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"{self._timing_prefix} {dt_str} build_snapshot_closure "
+                f"ts={snapshot_event_ts} elapsed_s={(time.perf_counter()-t0):.6f}"
+            )
+        return out2
 
     # ---------- Flush (finite-range only) ----------
     def flush(self) -> List[CandleClosure]:
@@ -710,6 +747,15 @@ class AggregatorManager:
 
         return out
 
+    # -----------------------------
+    # Utilities
+    # -----------------------------
+    @staticmethod
+    def _truthy_env(val: Optional[str]) -> bool:
+        if val is None:
+            return False
+        s = val.strip().lower()
+        return s not in ("", "0", "false", "no", "off")
 
 
 
@@ -761,24 +807,33 @@ class CandleIterator:
     """
     Iterates over base timeframe candles, returning CandleClosure objects.
 
-    Polling semantics (fixed):
-    - We now re-ingest rows whose timestamp equals the last-seen timestamp (ts == last_ts).
-      This is essential because many exchanges (incl. Bitfinex) will emit repeated snapshots
-      for the *current* candle as it forms. Those snapshots legitimately change OHLC/Volume.
-      Skipping ts == last_ts caused you to finalize with stale data on the next minute.
-    - We still skip strictly older rows (ts < last_ts).
-    - File selection for poll drains includes the file that contains 'last_ts' (inclusive),
-      so late updates for the current candle are not missed due to filename-range filtering.
+    Polling semantics:
+    - On transition to polling mode we perform the **first poll immediately**
+      (no initial sleep) and only then begin waiting per poll interval.
+    - We re-ingest rows whose timestamp equals the last-seen timestamp
+      (ts == last_ts) to capture evolving snapshots for the current candle.
+      We still skip strictly older rows (ts < last_ts).
 
-    Live-mode UX (unchanged, but clarified):
-    - After each poll cycle:
-        * If new rows came in, we emit closures derived from those rows.
-        * If no new rows came in, we still emit a heartbeat snapshot so the caller
-          gets an update each poll interval.
+    Low-latency emission:
+    - After each poll sync we **break as soon as a real closure is enqueued**,
+      i.e., only when the triggering row's timestamp strictly advances beyond
+      the starting `last_ts`. Same-ts *snapshots* do not cause an early break.
+    - To avoid tight re-drain loops, we only enable immediate re-drain
+      (no sleep, no resync) when the row that triggered the first emission
+      had a timestamp **strictly greater** than the starting last_ts.
 
-    CSV expectations (unchanged):
-    - Columns: timestamp, open, close, high, low, volume
-    - We yield tuples in the order: (ts, o, h, l, c, v)
+    Timing diagnostics:
+    - Enabled with env `CANDLES_SYNC_DEBUG_TIMING=1` or verbose=True.
+      Each poll cycle prints:
+        * sleep_s, sync_s
+        * list_files_s (time to enumerate candidate files since start point)
+        * drain_s (time to scan & ingest rows)
+        * ingest_s (time spent inside _ingest_row/aggregator)
+        * rows_scanned, first_row_ts, emitted_row_ts
+        * first_emit_after_sync_s (delay from sync end → first closure)
+        * advanced (whether emitted_row_ts > starting last_ts)
+        * closures_added (buffer delta)
+        * redrain (whether a no-sleep/no-resync continuation will occur)
     """
 
     def __init__(self, cfg: Config):
@@ -800,7 +855,7 @@ class CandleIterator:
 
         self.base_ms = TIMEFRAMES[self.cfg.base_timeframe]
 
-        # Polling-interval resolution and one-time announcement toggle
+        # Polling-interval and announcement toggle
         self.poll_interval_seconds: int = self._resolve_poll_interval_seconds()
         self.poll_interval_ms: int = max(MIN_POLL_INTERVAL_SECONDS, int(self.poll_interval_seconds)) * 1000
         self._polling_notice_emitted: bool = False
@@ -808,13 +863,20 @@ class CandleIterator:
         # Used only for finite end ranges
         self._final_flush_done: bool = False
 
+        # Hint to immediately re-drain (no sleep, no resync) if we advanced
+        self._redrain_after_first_emission: bool = False
+
+        # Timing diagnostics
+        self.debug_timing: bool = self._truthy_env(os.environ.get("CANDLES_SYNC_DEBUG_TIMING")) or bool(self.cfg.verbose)
+        self._timing_prefix = Fore.CYAN + "[TIMING]" + Style.RESET_ALL
+
     def __iter__(self) -> Iterator[CandleClosure]:
         return self
 
     def __next__(self) -> CandleClosure:
         global aggregator_manager
 
-        # Return buffered closures first
+        # Return buffered closures first (lowest latency)
         if self._closed_buffer:
             return self._closed_buffer.pop(0)
 
@@ -826,25 +888,37 @@ class CandleIterator:
                 if self.cfg.end_ts is not None:
                     if not self._final_flush_done:
                         all_closures = aggregator_manager.flush()
-                        # In finite-range mode we DO emit the final flush once.
                         self._closed_buffer.extend(all_closures)
                         self._final_flush_done = True
                         if self._closed_buffer:
                             return self._closed_buffer.pop(0)
                     raise StopIteration
 
-                # Live mode (no end_ts): switch to polling (no pre-poll emission)
+                # Live mode (no end_ts): switch to polling
                 if not self._polling_notice_emitted:
                     self._announce_polling_mode()
-
-                # Perform one poll cycle and drain any new data to buffer
-                self._poll_for_new_data_and_buffer()
+                    # FIRST POLL: run immediately (no sleep), resync from remote,
+                    # and stop draining as soon as any real closure is produced.
+                    self._poll_for_new_data_and_buffer(
+                        sleep_first=False, resync=True, stop_after_first_emission=True
+                    )
+                else:
+                    # If prior cycle produced a strictly-new row, re-drain immediately (no sleep/resync)
+                    if self._redrain_after_first_emission:
+                        self._poll_for_new_data_and_buffer(
+                            sleep_first=False, resync=False, stop_after_first_emission=True
+                        )
+                    else:
+                        # Normal cadence
+                        self._poll_for_new_data_and_buffer(
+                            sleep_first=True, resync=True, stop_after_first_emission=True
+                        )
 
                 # If the poll produced closures (from fresh rows), emit the first now.
                 if self._closed_buffer:
                     return self._closed_buffer.pop(0)
 
-                # Otherwise, emit a single heartbeat snapshot immediately so each poll yields an update
+                # Otherwise, emit a single heartbeat snapshot immediately
                 snap_ts = aggregator_manager.preferred_snapshot_ts()
                 snapshot = aggregator_manager.build_snapshot_closure(event_ts=snap_ts)
                 if snapshot is not None:
@@ -902,8 +976,6 @@ class CandleIterator:
             return
 
         # Normal or snapshot-update ingestion:
-        # - For row_ts == self._last_ts we update the same open minute with fresher OHLCV.
-        # - For row_ts >  self._last_ts we advance time as usual.
         closures = aggregator_manager.on_subcandle(row_ts, o, h, l, c, v)
         self._closed_buffer.extend(closures)
         self._last_ts = row_ts
@@ -954,41 +1026,144 @@ class CandleIterator:
         )
         self._polling_notice_emitted = True
 
-    def _poll_for_new_data_and_buffer(self) -> None:
+    def _poll_for_new_data_and_buffer(
+        self,
+        *,
+        sleep_first: bool = True,
+        resync: bool = True,
+        stop_after_first_emission: bool = False
+    ) -> None:
         """
-        Sleep for the poll interval, sync latest candles, then **drain** any new rows
-        inclusively from the last-seen timestamp into the local closure buffer.
-        If nothing new arrives, caller will emit a heartbeat snapshot.
+        Optionally sleep, optionally resync from the remote source, then drain new rows
+        from disk into the local closure buffer.
+
+        Args:
+            sleep_first:
+                If True, sleep for the configured poll interval before syncing/draining.
+                Disabled on the first poll and during immediate re-drains.
+            resync:
+                If True, call synchronize_candle_data() to fetch fresh data.
+                For immediate re-drains, set False to avoid an unnecessary follow-up sync.
+            stop_after_first_emission:
+                If True, stop draining as soon as we enqueue a **real** CandleClosure
+                triggered by a row whose timestamp strictly advances beyond the starting
+                last_ts. Same-ts snapshots are ignored for early-break purposes.
+
+        Timing diagnostics:
+            Prints a detailed timing summary when debug_timing is enabled, including
+            the critical metric `first_emit_after_sync_s` which is the delay from
+            the end of synchronize_candle_data() to the first emitted closure.
         """
-        # Sleep first to align with “poll every N seconds”
-        time.sleep(self.poll_interval_seconds)
+        import time as _time  # local alias to emphasize perf_counter/sleep scope
+        t_cycle_start = _time.perf_counter()
 
-        # Sync latest data; keep this quiet unless verbose requested at iterator level.
-        ok = synchronize_candle_data(
-            exchange=self.cfg.exchange,
-            ticker=self.cfg.ticker,
-            timeframe=self.cfg.base_timeframe,
-            end_date_str=None,  # always pull up to latest
-            polling=1,
-            verbose=self.cfg.verbose  # honor CLI -v
-        )
-        if not ok and self.cfg.verbose:
-            print(f"{WARNING} Poll sync failed; will retry on next interval.{Style.RESET_ALL}")
+        # Diagnostics: inputs & starting state
+        initial_last_ts = self._last_ts if self._last_ts is not None else -1
+        if self.debug_timing:
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"{self._timing_prefix} {now_str} poll_start "
+                  f"(sleep_first={sleep_first}, resync={resync}, initial_last_ts={initial_last_ts})")
 
-        # Rebuild a generator inclusively from the last-seen timestamp so we can
-        # ingest same-ts snapshot updates for the currently forming candle.
-        start_from = self._last_ts if self._last_ts is not None else (self.cfg.start_ts or 0)
+        # Default: assume we won't need a no-sleep re-drain unless proven otherwise
+        self._redrain_after_first_emission = False
+
+        # 1) Sleep (if requested)
+        sleep_s = 0.0
+        if sleep_first:
+            t0_sleep = _time.perf_counter()
+            _time.sleep(self.poll_interval_seconds)
+            sleep_s = _time.perf_counter() - t0_sleep
+
+        # 2) Sync (optional)
+        sync_s = 0.0
+        t_sync_end_perf = None
+        if resync:
+            t0_sync = _time.perf_counter()
+            ok = synchronize_candle_data(
+                exchange=self.cfg.exchange,
+                ticker=self.cfg.ticker,
+                timeframe=self.cfg.base_timeframe,
+                end_date_str=None,  # always pull up to latest
+                polling=1,
+                verbose=self.cfg.verbose  # honor CLI -v
+            )
+            sync_s = _time.perf_counter() - t0_sync
+            if not ok and self.cfg.verbose:
+                print(f"{WARNING} Poll sync failed; will retry on next interval.{Style.RESET_ALL}")
+            t_sync_end_perf = _time.perf_counter()  # mark sync-finish moment
+
+        # 3) Decide start point for reading:
+        #    - Resync pass: inclusive (>= last_ts) to pick up same-ts snapshot updates.
+        #    - Re-drain pass: strict (> last_ts) to avoid re-reading the same row.
+        if resync:
+            start_from = self._last_ts if self._last_ts is not None else (self.cfg.start_ts or 0)
+        else:
+            start_from = (self._last_ts + 1) if self._last_ts is not None else (self.cfg.start_ts or 0)
+
+        # 3a) (Diagnostics) File-list time & count
+        list_files_s = 0.0
+        files_cnt = None
+        if self.debug_timing:
+            t0_list = _time.perf_counter()
+            try:
+                files_cnt = len(self._list_csv_files_since(start_from))
+            except Exception:
+                files_cnt = None
+            list_files_s = _time.perf_counter() - t0_list
+
+        # 4) Drain rows until first emission (or EOF)
+        t0_drain = _time.perf_counter()
         gen = self._load_candles_since(start_from)
 
-        # Drain *all* newly arrived rows from this poll into the buffer
         drained_any = False
+        rows_scanned = 0
+        first_row_ts: Optional[int] = None
+        emitted_row_ts: Optional[int] = None
+        closures_before = len(self._closed_buffer)
+        ingest_time_s = 0.0
+        first_emit_after_sync_s = None  # <-- key metric
+
         for row in gen:
             drained_any = True
+            rows_scanned += 1
             row_ts, o, h, l, c, v = row
-            self._ingest_row(row_ts, o, h, l, c, v)
+            if first_row_ts is None:
+                first_row_ts = row_ts
 
-        # Optional: small verbose hint if nothing new arrived this poll
-        if self.cfg.verbose and not drained_any:
+            t0_ingest = _time.perf_counter()
+            before = len(self._closed_buffer)
+            self._ingest_row(row_ts, o, h, l, c, v)
+            t1_ingest = _time.perf_counter()
+            ingest_time_s += (t1_ingest - t0_ingest)
+
+            # FIX: break only when a **real closure** occurs from a row that strictly
+            # advances the last_ts baseline. Same-ts snapshots no longer cause an early break.
+            if stop_after_first_emission and len(self._closed_buffer) > before and row_ts > initial_last_ts:
+                emitted_row_ts = row_ts
+                # If a sync happened this cycle, measure delay from sync end to first emit
+                if t_sync_end_perf is not None:
+                    first_emit_after_sync_s = (t1_ingest - t_sync_end_perf)
+                # We advanced beyond the starting timestamp -> allow immediate re-drain
+                self._redrain_after_first_emission = True
+                break
+
+        drain_s = _time.perf_counter() - t0_drain
+        closures_added = len(self._closed_buffer) - closures_before
+
+        # 5) Timing summary
+        if self.debug_timing:
+            advanced = (emitted_row_ts is not None and emitted_row_ts > initial_last_ts)
+            now_str_end = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"{self._timing_prefix} {now_str_end} poll_summary "
+                f"sleep_s={sleep_s:.3f} sync_s={sync_s:.3f} list_files_s={list_files_s:.3f} "
+                f"drain_s={drain_s:.3f} ingest_s={ingest_time_s:.3f} files={files_cnt} "
+                f"rows_scanned={rows_scanned} first_row_ts={first_row_ts} emitted_row_ts={emitted_row_ts} "
+                f"first_emit_after_sync_s={(first_emit_after_sync_s if first_emit_after_sync_s is not None else -1):.3f} "
+                f"advanced={advanced} closures_added={closures_added} redrain={self._redrain_after_first_emission}"
+            )
+
+        if self.cfg.verbose and resync and not drained_any:
             print(f"{INFO} Poll returned no new rows; emitting snapshot.")
 
     # -----------------------------
@@ -1161,8 +1336,9 @@ class CandleIterator:
         any files that might have appeared/expanded since last read.
         Yields (ts, o, h, l, c, v).
 
-        Rationale: We include the row at exactly the last-seen timestamp so we can
-        ingest updated snapshots (same timestamp, fresher OHLCV).
+        Rationale: On a resync pass we include the row at exactly the last-seen
+        timestamp so we can ingest updated snapshots (same timestamp, fresher OHLCV).
+        For re-drains we call this with (last_ts + 1) so the effect is strict.
         """
         file_list = self._list_csv_files_since(start_inclusive_ts)  # inclusive lower bound
         for csv_path in file_list:
@@ -1185,13 +1361,24 @@ class CandleIterator:
                     except ValueError:
                         continue
 
-                    # Inclusive lower bound: allow ts == last_ts to update the current candle.
+                    # Inclusive lower bound enforced by caller; for re-drain we pass last_ts+1
                     if ts < start_inclusive_ts:
                         continue
                     if self.cfg.end_ts and ts > self.cfg.end_ts:
                         return  # respect explicit end bound if ever set
 
                     yield (ts, o, h, l, c, v)
+
+    # -----------------------------
+    # Utilities
+    # -----------------------------
+    @staticmethod
+    def _truthy_env(val: Optional[str]) -> bool:
+        if val is None:
+            return False
+        s = val.strip().lower()
+        return s not in ("", "0", "false", "no", "off")
+
 
 # ----------------------------------------------------------------------
 # create_candle_iterator
@@ -1207,6 +1394,20 @@ def create_candle_iterator(
     verbose: bool = False,
     poll_interval_seconds: Optional[int] = None,
 ) -> Iterator[CandleClosure]:
+    """
+    Factory for CandleIterator. This version also injects a wrapper around
+    `synchronize_candle_data` so we emit a TRACE line *exactly* when that
+    function returns (in addition to your existing outer timing).
+
+    The wrapper is enabled when:
+      - env CANDLES_SYNC_TRACE is truthy (1/true/yes/on), OR
+      - verbose=True
+    """
+
+    def _truthy_env(val: Optional[str]) -> bool:
+        return (val or "").strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+    # --- Validate paths and timeframes ---
     data_path = os.path.expanduser(f"{data_dir}/{exchange}/candles/{ticker}/{base_timeframe}")
     if not os.path.exists(data_path):
         raise ValueError(f"No data directory found: {data_path}")
@@ -1232,35 +1433,24 @@ def create_candle_iterator(
     start_ts = parse_timestamp(start_date, True)
     end_ts = parse_timestamp(end_date, False)
 
-    # ----------------------------------------------------------------------
-    # FIX / IMPROVEMENT:
-    # 1) Identify the highest timeframe.
-    # 2) Compute 200 bars back from 'end_ts' in that timeframe.
-    # 3) Align 'start_ts' to the boundary of that highest timeframe.
-    # 4) Only do this if 'start_ts' was not supplied by the user.
-    # ----------------------------------------------------------------------
+    # If no explicit start, back off 200 bars of the largest TF and align
     if start_ts is None:
         largest_tf = max(parsed_tfs, key=lambda x: TIMEFRAMES[x])
         largest_tf_ms = TIMEFRAMES[largest_tf]
 
         if end_ts is None:
-            # If still no end_ts, assume 'now'.
             end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
             if verbose:
                 print(f"{INFO} No end date supplied. Using 'now' => {end_ts}.")
 
-        # We go 200 candles back in the largest timeframe
         raw_start_ts = end_ts - (200 * largest_tf_ms)
-
-        # Align to largest_tf boundary
-        aligned_start_ts = (raw_start_ts // largest_tf_ms) * largest_tf_ms
-
-        start_ts = aligned_start_ts
+        start_ts = (raw_start_ts // largest_tf_ms) * largest_tf_ms
 
         if verbose:
-            print(f"{INFO} No start date supplied. Using highest timeframe '{largest_tf}' ("
-                  f"{largest_tf_ms} ms) and 200 bars => raw start = {raw_start_ts}, aligned to {aligned_start_ts}.")
+            print(f"{INFO} No start date supplied. Using highest timeframe '{largest_tf}' "
+                  f"({largest_tf_ms} ms) and 200 bars => raw start = {raw_start_ts}, aligned to {start_ts}.")
 
+    # --- Build manager and config ---
     global aggregator_manager
     higher_tfs = [t for t in parsed_tfs if t != base_timeframe]
     aggregator_manager = AggregatorManager(base_timeframe, higher_tfs, verbose=verbose)
@@ -1276,6 +1466,39 @@ def create_candle_iterator(
         poll_interval_seconds=poll_interval_seconds,
     )
 
+    # --- Enable "trace-at-return" for synchronize_candle_data by rebinding the imported symbol ---
+    # This guarantees you see a TRACE line at the *exact* moment the function returns,
+    # regardless of what the inner candles-sync logs measure.
+    should_wrap = _truthy_env(os.environ.get("CANDLES_SYNC_TRACE")) or verbose
+    if should_wrap:
+        # We rebind the *imported* symbol `synchronize_candle_data` in this module’s globals
+        # so all subsequent calls (including inside CandleIterator polling) go through the wrapper.
+        global synchronize_candle_data
+        _orig_sync = synchronize_candle_data  # keep original
+
+        # Avoid double-wrapping
+        if not getattr(_orig_sync, "_return_traced", False):
+            def _utc_now_ms() -> str:
+                return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "Z"
+
+            def _sync_wrapper(*args, **kwargs):
+                # Entry marker (optional but useful)
+                print(f"{Fore.MAGENTA}[TRACE]{Style.RESET_ALL} {_utc_now_ms()} sync:call")
+                t0 = time.perf_counter()
+                ok = False
+                try:
+                    res = _orig_sync(*args, **kwargs)
+                    ok = bool(res)
+                    return res
+                finally:
+                    dt_ms = (time.perf_counter() - t0) * 1000.0
+                    print(f"{Fore.MAGENTA}[TRACE]{Style.RESET_ALL} {_utc_now_ms()} sync:return ok={ok} duration_ms={dt_ms:.1f}")
+
+            # Mark wrapper to prevent re-wrapping and rebind
+            setattr(_sync_wrapper, "_return_traced", True)
+            synchronize_candle_data = _sync_wrapper  # type: ignore[assignment]
+
+    # --- Initial backfill sync (now wrapped if tracing enabled) ---
     end_date_str = None
     if end_ts:
         end_dt = datetime.fromtimestamp(end_ts / 1000, timezone.utc)
@@ -1292,7 +1515,9 @@ def create_candle_iterator(
         print(f"\n{ERROR} Synchronization failed for {base_timeframe}.\n")
         sys.exit(1)
 
+
     return CandleIterator(cfg)
+
 
 
 if __name__ == "__main__":
