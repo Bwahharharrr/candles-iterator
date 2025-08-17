@@ -808,19 +808,22 @@ class CandleIterator:
     Iterates over base timeframe candles, returning CandleClosure objects.
 
     Polling semantics:
-    - On transition to polling mode we perform the **first poll immediately**
-      (no initial sleep) and only then begin waiting per poll interval.
-    - We re-ingest rows whose timestamp equals the last-seen timestamp
-      (ts == last_ts) to capture evolving snapshots for the current candle.
-      We still skip strictly older rows (ts < last_ts).
+    - Polling is **disabled by default** (i.e., when `poll_interval_seconds` is None).
+      In that case, the iterator behaves as a finite stream: once historical files
+      are exhausted, it flushes pending closures/partials and ends.
+    - If polling is enabled (via env `CANDLES_SYNC_POLL_INTERVAL_SECS` or a positive
+      `poll_interval_seconds`), on transition to polling mode we perform the **first
+      poll immediately** (no initial sleep) and only then begin waiting per poll interval.
+
+    Live snapshot ingestion:
+    - We re-ingest rows whose timestamp equals the last-seen timestamp (ts == last_ts)
+      to capture evolving snapshots for the current candle. We still skip strictly
+      older rows (ts < last_ts).
 
     Low-latency emission:
     - After each poll sync we **break as soon as a real closure is enqueued**,
       i.e., only when the triggering row's timestamp strictly advances beyond
       the starting `last_ts`. Same-ts *snapshots* do not cause an early break.
-    - To avoid tight re-drain loops, we only enable immediate re-drain
-      (no sleep, no resync) when the row that triggered the first emission
-      had a timestamp **strictly greater** than the starting last_ts.
 
     Timing diagnostics:
     - Enabled with env `CANDLES_SYNC_DEBUG_TIMING=1` or verbose=True.
@@ -856,11 +859,15 @@ class CandleIterator:
         self.base_ms = TIMEFRAMES[self.cfg.base_timeframe]
 
         # Polling-interval and announcement toggle
-        self.poll_interval_seconds: int = self._resolve_poll_interval_seconds()
-        self.poll_interval_ms: int = max(MIN_POLL_INTERVAL_SECONDS, int(self.poll_interval_seconds)) * 1000
+        self.poll_interval_seconds: Optional[int] = self._resolve_poll_interval_seconds()
+        self.poll_interval_ms: Optional[int] = (
+            max(MIN_POLL_INTERVAL_SECONDS, int(self.poll_interval_seconds)) * 1000
+            if self.poll_interval_seconds is not None else
+            None
+        )
         self._polling_notice_emitted: bool = False
 
-        # Used only for finite end ranges
+        # Used only for finite end ranges (including "polling disabled" mode)
         self._final_flush_done: bool = False
 
         # Hint to immediately re-drain (no sleep, no resync) if we advanced
@@ -884,8 +891,8 @@ class CandleIterator:
             try:
                 row_ts, o, h, l, c, v = next(self._candles_gen)
             except StopIteration:
-                # If an explicit end_ts was set, we truly end.
-                if self.cfg.end_ts is not None:
+                # If an explicit end_ts was set OR polling is disabled, we truly end.
+                if self.cfg.end_ts is not None or self.poll_interval_seconds is None:
                     if not self._final_flush_done:
                         all_closures = aggregator_manager.flush()
                         self._closed_buffer.extend(all_closures)
@@ -894,7 +901,7 @@ class CandleIterator:
                             return self._closed_buffer.pop(0)
                     raise StopIteration
 
-                # Live mode (no end_ts): switch to polling
+                # Live mode (no end_ts) with polling enabled: switch to polling
                 if not self._polling_notice_emitted:
                     self._announce_polling_mode()
                     # FIRST POLL: run immediately (no sleep), resync from remote,
@@ -984,13 +991,15 @@ class CandleIterator:
     # -----------------------------
     # Polling helpers
     # -----------------------------
-    def _resolve_poll_interval_seconds(self) -> int:
+    def _resolve_poll_interval_seconds(self) -> Optional[int]:
         """
-        Determine the polling interval to report when entering polling mode.
-        Priority:
-            1) ENV: CANDLES_SYNC_POLL_INTERVAL_SECS
-            2) cfg.poll_interval_seconds (CLI flag)
-            3) base timeframe duration in seconds
+        Determine the polling interval to use when entering polling mode.
+        Returns:
+            Optional[int]: the interval in seconds, or None to **disable polling**.
+        Priority (first valid wins):
+            1) ENV: CANDLES_SYNC_POLL_INTERVAL_SECS (>= MIN_POLL_INTERVAL_SECONDS)
+            2) cfg.poll_interval_seconds (>= MIN_POLL_INTERVAL_SECONDS)
+            3) default: None  => polling disabled by default
         """
         env_val = os.environ.get(ENV_POLL_INTERVAL_KEY)
         if env_val:
@@ -1009,13 +1018,14 @@ class CandleIterator:
             except (ValueError, TypeError):
                 pass  # fall back
 
-        return max(MIN_POLL_INTERVAL_SECONDS, TIMEFRAMES[self.cfg.base_timeframe] // 1000)
+        # Default: polling disabled unless explicitly enabled
+        return None
 
     def _announce_polling_mode(self) -> None:
         """
         Print a single update when we transition from file iteration to polling mode.
         """
-        if self._polling_notice_emitted:
+        if self._polling_notice_emitted or self.poll_interval_seconds is None:
             return
 
         interval_s = self.poll_interval_seconds
@@ -1071,7 +1081,7 @@ class CandleIterator:
         sleep_s = 0.0
         if sleep_first:
             t0_sleep = _time.perf_counter()
-            _time.sleep(self.poll_interval_seconds)
+            _time.sleep(self.poll_interval_seconds)  # type: ignore[arg-type]
             sleep_s = _time.perf_counter() - t0_sleep
 
         # 2) Sync (optional)
@@ -1399,6 +1409,11 @@ def create_candle_iterator(
     `synchronize_candle_data` so we emit a TRACE line *exactly* when that
     function returns (in addition to your existing outer timing).
 
+    Polling default:
+    - Passing `poll_interval_seconds=None` (the default) **disables polling**.
+      To enable live polling after the historical drain, pass a positive value
+      or set ENV `CANDLES_SYNC_POLL_INTERVAL_SECS`.
+
     The wrapper is enabled when:
       - env CANDLES_SYNC_TRACE is truthy (1/true/yes/on), OR
       - verbose=True
@@ -1514,7 +1529,6 @@ def create_candle_iterator(
     if not ok:
         print(f"\n{ERROR} Synchronization failed for {base_timeframe}.\n")
         sys.exit(1)
-
 
     return CandleIterator(cfg)
 
