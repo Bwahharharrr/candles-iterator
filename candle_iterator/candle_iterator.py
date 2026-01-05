@@ -1133,7 +1133,7 @@ class Config:
         verbose=False,
         poll_interval_seconds: Optional[int] = None
     ):
-        self.exchange = exchange
+        self.exchange = exchange.upper()
         self.ticker = ticker
         self.base_timeframe = base_timeframe
         self.start_ts = start_ts
@@ -1835,6 +1835,8 @@ def create_candle_iterator(
         return (val or "").strip().lower() in ("1", "true", "yes", "on", "y", "t")
 
     # --- Validate paths and timeframes ---
+    exchange = exchange.upper()
+     
     data_path = os.path.expanduser(f"{data_dir}/{exchange}/candles/{ticker}/{base_timeframe}")
     if not os.path.exists(data_path):
         raise ValueError(f"No data directory found: {data_path}")
