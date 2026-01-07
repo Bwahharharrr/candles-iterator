@@ -1836,10 +1836,6 @@ def create_candle_iterator(
 
     # --- Validate paths and timeframes ---
     exchange = exchange.upper()
-     
-    data_path = os.path.expanduser(f"{data_dir}/{exchange}/candles/{ticker}/{base_timeframe}")
-    if not os.path.exists(data_path):
-        raise ValueError(f"No data directory found: {data_path}")
 
     if base_timeframe not in TIMEFRAMES:
         raise ValueError(f"Invalid base timeframe: {base_timeframe}")
