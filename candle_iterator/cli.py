@@ -36,7 +36,6 @@ from .candle_iterator import (
 # -----------------------------
 DEFAULT_DATA_DIR: str = "~/.corky"
 DEFAULT_BASE_TIMEFRAME: str = "1m"
-MAX_PRINTED_CLOSURES: int = 5  # print a few examples, then a summary
 SEP_BULLET: str = " · "        # visual separator for one-line summaries
 EMPTY_DASH: str = "—"          # nice dash for absent params in summaries
 DEFAULT_POLL_INTERVAL_SECS: Optional[int] = None  # None => derive from base TF
@@ -101,7 +100,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--end", dest="end_date", default=None, help="End date 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM' (UTC)")
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help=f"Root data directory (default: {DEFAULT_DATA_DIR})")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
-    parser.add_argument("--print-all", action="store_true", help="Print every CandleClosure (very chatty)")
 
     return parser.parse_args(argv)
 
@@ -153,7 +151,6 @@ def print_closure(cc: CandleClosure) -> None:
     """Pretty-print a single CandleClosure using its built-in helpers."""
     # Use the compact one-liner by default; CandleClosure.print() remains available for deep dives.
     cc.print()
-    # print(cc.print())
 
 
 def run_cli(
@@ -165,7 +162,6 @@ def run_cli(
     end_date: Optional[str],
     data_dir: str,
     verbose: bool,
-    print_all: bool,
     poll_interval: Optional[int],
 ) -> int:
     """
@@ -188,13 +184,13 @@ def run_cli(
         sys.stderr.write(f"{ERROR} Failed to create iterator: {exc}{Style.RESET_ALL}\n")
         return 2
 
-    printed = 0
     total = 0
     last_closure: Optional[CandleClosure] = None
 
     try:
         for cc in iterator:
             total += 1
+            last_closure = cc
             print_closure(cc)
     except KeyboardInterrupt:
         sys.stderr.write(f"{WARNING} Interrupted by user.{Style.RESET_ALL}\n")
@@ -239,7 +235,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         end_date=args.end_date,
         data_dir=args.data_dir,
         verbose=args.verbose,
-        print_all=args.print_all,
         poll_interval=args.poll_interval,
     )
     raise SystemExit(exit_code)

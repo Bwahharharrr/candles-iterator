@@ -2,7 +2,6 @@
 
 import argparse
 import csv
-import json
 import os
 import re
 import sys
@@ -58,6 +57,9 @@ TAIL_BACKTRACK_BYTES: int = 4096  # re-parse this many trailing bytes every poll
 FAST_APPEND_DISABLE_ENV: str = "CANDLES_SYNC_DISABLE_FAST_APPEND"
 FAST_APPEND_HEADER: Tuple[str, ...] = ("timestamp", "open", "close", "high", "low", "volume")
 
+# Pre-compiled regex for relational timeframe expressions (e.g., ">=1h", "<4h")
+_RELATION_RE = re.compile(r"^(<=|>=|<|>)([0-9]+[mhDWhd]+)$")
+
 # ----------------------------------------------------------------------
 # 2) LOCAL IMPORT: SYNCHRONIZE FUNCTION
 # ----------------------------------------------------------------------
@@ -66,11 +68,11 @@ from candles_sync import synchronize_candle_data  # noqa: E402
 # ----------------------------------------------------------------------
 # 2.1) APPEND-ONLY FAST PATH FOR candles_sync.write_partition (monkey patch)
 # ----------------------------------------------------------------------
-def _truthy_env_local(val: Optional[str]) -> bool:
+def _truthy_env(val: Optional[str]) -> bool:
+    """Module-level truthy check for environment variable values (strict whitelist)."""
     if val is None:
         return False
-    s = val.strip().lower()
-    return s not in ("", "0", "false", "no", "off")
+    return val.strip().lower() in ("1", "true", "yes", "on", "y", "t")
 
 
 def _ensure_parent_dir(path: str) -> None:
@@ -150,7 +152,8 @@ def _read_last_row_timestamp(csv_path: str) -> Optional[int]:
             except Exception:
                 continue
         return None
-    except Exception:
+    except Exception as exc:
+        print(f"{WARNING} _read_last_row_timestamp failed for {csv_path}: {exc}{Style.RESET_ALL}")
         return None
 
 
@@ -243,7 +246,8 @@ def _canonicalize_input_df(df: Any) -> Optional[Any]:
         if work.empty:
             return None
         return work
-    except Exception:
+    except Exception as exc:
+        print(f"{WARNING} _canonicalize_input_df failed: {exc}{Style.RESET_ALL}")
         return None
 
 
@@ -311,7 +315,7 @@ def _fast_write_partition_wrapper_factory(original_write_fn: Any):
     """
     def _wrapped_write(*args: Any, **kwargs: Any) -> Any:
         # Allow users to disable the optimization via ENV for any reason.
-        if _truthy_env_local(os.environ.get(FAST_APPEND_DISABLE_ENV)):
+        if _truthy_env(os.environ.get(FAST_APPEND_DISABLE_ENV)):
             return original_write_fn(*args, **kwargs)
 
         try:
@@ -346,8 +350,9 @@ def _fast_write_partition_wrapper_factory(original_write_fn: Any):
 
             # Overlap/backfill: fall back to original full-merge implementation
             return original_write_fn(*args, **kwargs)
-        except Exception:
+        except Exception as exc:
             # On any unexpected issue, defer to the original implementation.
+            print(f"{WARNING} fast-append wrapper failed ({exc}), falling back to original writer{Style.RESET_ALL}")
             return original_write_fn(*args, **kwargs)
 
     setattr(_wrapped_write, "_fast_append_installed", True)
@@ -377,9 +382,9 @@ def _install_fast_append_writer() -> None:
         wrapped = _fast_write_partition_wrapper_factory(original)
         setattr(_cs, "write_partition", wrapped)
         setattr(_cs, "_fast_append_writer_installed", True)
-    except Exception:
+    except Exception as exc:
         # Never fail the import path due to patching.
-        pass
+        print(f"{WARNING} fast-append writer install failed: {exc}{Style.RESET_ALL}")
 
 
 # Attempt to install at import time (safe, idempotent). Also called again in factory for certainty.
@@ -433,8 +438,7 @@ def parse_single_relation_or_exact(expr):
     if expr in TIMEFRAMES:
         return {expr}
 
-    pattern = r"^(<=|>=|<|>)([0-9]+[mhDWhd]+)$"
-    match = re.match(pattern, expr)
+    match = _RELATION_RE.match(expr)
     if match:
         op = match.group(1)
         tf_str = match.group(2)
@@ -842,6 +846,7 @@ class AggregatorManager:
         # Pending closures since the last emission:
         # A list of (event_ts, {tf: (tf, label_ts, o, h, l, c, v)})
         self._pending: List[Tuple[int, Dict[str, Tuple[str, int, float, float, float, float, float]]]] = []
+        self._pending_tf_count: int = 0  # O(1) counter for total TFs across pending buckets
 
         # Rolling "as-of-last-emission" closed state (same tuple format as above)
         self._last_emitted_closed_state: Dict[str, Tuple[str, int, float, float, float, float, float]] = {}
@@ -853,7 +858,7 @@ class AggregatorManager:
         self.closure_source: CandleClosureSource = CandleClosureSource.HISTORICAL
 
         # Timing diagnostics toggle
-        self.debug_timing: bool = self._truthy_env(os.environ.get("CANDLES_SYNC_DEBUG_TIMING")) or bool(self.verbose)
+        self.debug_timing: bool = _truthy_env(os.environ.get("CANDLES_SYNC_DEBUG_TIMING")) or bool(self.verbose)
         self._timing_prefix = Fore.CYAN + "[TIMING]" + Style.RESET_ALL
 
     # ---------- Public snapshot utilities ----------
@@ -934,18 +939,20 @@ class AggregatorManager:
         self.latest_closed_candles[tf] = rec
 
         if self._pending and self._pending[-1][0] == aggregator_closure_ts:
-            # Merge into existing last bucket
+            # Merge into existing last bucket (only increment if tf is new to this bucket)
+            if tf not in self._pending[-1][1]:
+                self._pending_tf_count += 1
             self._pending[-1][1][tf] = rec
         else:
             # Append new bucket (we deliberately keep simple ordered list)
             self._pending.append((aggregator_closure_ts, {tf: rec}))
+            self._pending_tf_count += 1
 
         if self.debug_timing:
             dt_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            pend_count = sum(len(bucket[1]) for bucket in self._pending)
             print(
                 f"{self._timing_prefix} {dt_str} record_closure tf={tf} label_ts={label_ts} "
-                f"event_ts={aggregator_closure_ts} pending_tf_count={pend_count} "
+                f"event_ts={aggregator_closure_ts} pending_tf_count={self._pending_tf_count} "
                 f"handler_s={(time.perf_counter()-t0):.6f}"
             )
 
@@ -1004,6 +1011,7 @@ class AggregatorManager:
             # Update rolling baseline and clear pending
             self._last_emitted_closed_state = rolling_closed
             self._pending.clear()
+            self._pending_tf_count = 0
 
             if self.debug_timing:
                 dt_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -1055,6 +1063,9 @@ class AggregatorManager:
 
         # If higher TFs already have enough subs, allow them to finalize (logical completion)
         for agg in self.higher_aggs:
+            # Skip aggregators with no data (avoids nonsensical epoch-0 timestamps)
+            if agg.last_sub_ts is None and agg.current_boundary is None:
+                continue
             if agg.open_ts is not None and agg.sub_count >= agg.sub_factor:
                 if self.verbose:
                     print(f"{Fore.MAGENTA}[DEBUG]{Style.RESET_ALL} forcibly finalizing aggregator {agg.tf}")
@@ -1095,15 +1106,6 @@ class AggregatorManager:
 
         return out
 
-    # -----------------------------
-    # Utilities
-    # -----------------------------
-    @staticmethod
-    def _truthy_env(val: Optional[str]) -> bool:
-        if val is None:
-            return False
-        s = val.strip().lower()
-        return s not in ("", "0", "false", "no", "off")
 
 
 def parse_timestamp(date_str, is_start=True):
@@ -1111,7 +1113,13 @@ def parse_timestamp(date_str, is_start=True):
         return None
     try:
         if len(date_str) == 10:
-            date_str += " 00:00" if is_start else " 23:59"
+            if is_start:
+                dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            else:
+                # End-of-day: next day midnight minus 1ms to cover 23:59:59.999
+                dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                dt = dt + timedelta(days=1) - timedelta(milliseconds=1)
+            return int(dt.timestamp() * 1000)
         dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
         return int(dt.timestamp() * 1000)
     except ValueError:
@@ -1210,7 +1218,7 @@ class CandleIterator:
         self._redrain_after_first_emission: bool = False
 
         # Timing diagnostics
-        self.debug_timing: bool = self._truthy_env(os.environ.get("CANDLES_SYNC_DEBUG_TIMING")) or bool(self.cfg.verbose)
+        self.debug_timing: bool = _truthy_env(os.environ.get("CANDLES_SYNC_DEBUG_TIMING")) or bool(self.cfg.verbose)
         self._timing_prefix = Fore.CYAN + "[TIMING]" + Style.RESET_ALL
 
         # ---- Tail-follow cache (steady-state) ----
@@ -1454,8 +1462,11 @@ class CandleIterator:
         path = self._ensure_tail_file_current()
         if path is not None and os.path.exists(path):
             try:
+                # Note: there is a benign TOCTOU race between os.stat() and open()/read() below —
+                # the file could rotate between these calls. This is handled by inode-based rotation
+                # detection on the next poll cycle (_ensure_tail_file_current checks inode/dev).
                 st = os.stat(path)
-                # Decide start offset (inclusive), with BACKTRACK for inclusive “same-ts” updates
+                # Decide start offset (inclusive), with BACKTRACK for inclusive "same-ts" updates
                 start_offset = max(0, self._tail_offset - self._tail_backtrack_bytes)
                 end_size = st.st_size
 
@@ -1476,7 +1487,9 @@ class CandleIterator:
                 tail_decode_s = _time.perf_counter() - t0_decode
 
                 if start_offset > 0:
-                    # Drop the first partial line to align on a full record boundary
+                    # Drop the first partial line to align on a full record boundary.
+                    # Assumption: OHLCV CSV lines are ~60 bytes, well within TAIL_BACKTRACK_BYTES (4096),
+                    # so a complete line will always be found within the backtrack window.
                     nl = text.find("\n")
                     if nl >= 0:
                         text = text[nl + 1:]
@@ -1503,7 +1516,9 @@ class CandleIterator:
                             h = float(parts[3])
                             l = float(parts[4])
                             v = float(parts[5])
-                        except Exception:
+                        except (ValueError, IndexError):
+                            if self.cfg.verbose:
+                                print(f"{WARNING} Skipping malformed CSV row in tail: {line[:80]}{Style.RESET_ALL}")
                             continue
 
                         drained_any = True
@@ -1531,9 +1546,9 @@ class CandleIterator:
                 self._tail_offset = end_size
                 self._tail_size = end_size
 
-            except Exception:
+            except Exception as exc:
                 # If anything goes wrong tailing, do not crash the iterator; next poll will retry
-                pass
+                print(f"{WARNING} tail-follow error: {exc}{Style.RESET_ALL}")
 
         tail_total_s = _time.perf_counter() - t0_tail_total
         closures_added = len(self._closed_buffer) - closures_before
@@ -1676,7 +1691,9 @@ class CandleIterator:
                 files = self._list_csv_files()
                 if files:
                     candidate = files[-1]
-            except Exception:
+            except Exception as exc:
+                if self.cfg.verbose:
+                    print(f"{WARNING} _ensure_tail_file_current fallback failed: {exc}{Style.RESET_ALL}")
                 return None
 
         if not os.path.exists(candidate):
@@ -1791,15 +1808,6 @@ class CandleIterator:
 
                     yield (ts, o, h, l, c, v)
 
-    # -----------------------------
-    # Utilities
-    # -----------------------------
-    @staticmethod
-    def _truthy_env(val: Optional[str]) -> bool:
-        if val is None:
-            return False
-        s = val.strip().lower()
-        return s not in ("", "0", "false", "no", "off")
 
 
 # ----------------------------------------------------------------------
@@ -1830,9 +1838,6 @@ def create_candle_iterator(
       - env CANDLES_SYNC_TRACE is truthy (1/true/yes/on), OR
       - verbose=True
     """
-
-    def _truthy_env(val: Optional[str]) -> bool:
-        return (val or "").strip().lower() in ("1", "true", "yes", "on", "y", "t")
 
     # --- Validate paths and timeframes ---
     exchange = exchange.upper()
