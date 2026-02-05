@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Iterator, Optional, Any
@@ -475,7 +476,7 @@ class CandleClosureSource(str, Enum):
     LIVE = "Live"
 
 
-@dataclass
+@dataclass(slots=True)
 class Candle:
     """
     Holds a single candle's OHLCV data.
@@ -498,7 +499,7 @@ class Candle:
                 f"o={self.open},h={self.high},l={self.low},c={self.close},v={self.volume}")
 
 
-@dataclass
+@dataclass(slots=True)
 class CandleClosure:
     """
     A closure event from AggregatorManager, containing:
@@ -553,7 +554,7 @@ class CandleClosure:
 # ----------------------------------------------------------------------
 # CandleAggregator
 # ----------------------------------------------------------------------
-@dataclass
+@dataclass(slots=True)
 class Partial:
     ts: int
     o: float
@@ -781,7 +782,7 @@ class CandleAggregator:
             committed_vol = float(self.volume)
         elif self._seed_next_open_ts is not None and self._seed_next_open_price is not None:
             boundary_ts = self._seed_next_open_ts
-            o = h = l = c = float(self._seed_next_open_price)
+            o = h = l = c = self._seed_next_open_price
             committed_vol = 0.0
 
         preview_vol = committed_vol
@@ -791,15 +792,15 @@ class CandleAggregator:
                 lp_boundary = (lp_ts // self.tf_ms) * self.tf_ms
                 if boundary_ts is None:
                     boundary_ts = lp_boundary
-                    o = h = l = c = float(self._live_partial.o)
+                    o = h = l = c = self._live_partial.o
                     committed_vol = 0.0
                 if boundary_ts == lp_boundary:
                     if self.sub_count == 0:
-                        o = float(self._live_partial.o)
-                    h = max(float(h), float(self._live_partial.h)) if h is not None else float(self._live_partial.h)
-                    l = min(float(l), float(self._live_partial.l)) if l is not None else float(self._live_partial.l)
-                    c = float(self._live_partial.c)
-                    preview_vol = committed_vol + float(self._live_partial.v)
+                        o = self._live_partial.o
+                    h = max(h, self._live_partial.h) if h is not None else self._live_partial.h
+                    l = min(l, self._live_partial.l) if l is not None else self._live_partial.l
+                    c = self._live_partial.c
+                    preview_vol = committed_vol + self._live_partial.v
 
         if boundary_ts is None or o is None or h is None or l is None or c is None:
             return None
@@ -807,11 +808,11 @@ class CandleAggregator:
         return Candle(
             timeframe=self.tf,
             timestamp=int(boundary_ts),
-            open=float(o),
-            high=float(h),
-            low=float(l),
-            close=float(c),
-            volume=float(preview_vol),
+            open=o,
+            high=h,
+            low=l,
+            close=c,
+            volume=preview_vol,
         )
 
 
@@ -839,17 +840,16 @@ class AggregatorManager:
             agg = CandleAggregator(tf, manager=self, is_base=False, sub_factor=factor)
             self.higher_aggs.append(agg)
 
-        # Snapshots of latest closed by TF
-        # (tuple format: (tf, label_ts, o, h, l, c, v))
-        self.latest_closed_candles: Dict[str, Tuple[str, int, float, float, float, float, float]] = {}
+        # Snapshots of latest closed by TF (stored as Candle objects directly)
+        self.latest_closed_candles: Dict[str, Candle] = {}
 
         # Pending closures since the last emission:
-        # A list of (event_ts, {tf: (tf, label_ts, o, h, l, c, v)})
-        self._pending: List[Tuple[int, Dict[str, Tuple[str, int, float, float, float, float, float]]]] = []
+        # A list of (event_ts, {tf: Candle})
+        self._pending: List[Tuple[int, Dict[str, Candle]]] = []
         self._pending_tf_count: int = 0  # O(1) counter for total TFs across pending buckets
 
-        # Rolling "as-of-last-emission" closed state (same tuple format as above)
-        self._last_emitted_closed_state: Dict[str, Tuple[str, int, float, float, float, float, float]] = {}
+        # Rolling "as-of-last-emission" closed state (Candle objects)
+        self._last_emitted_closed_state: Dict[str, Candle] = {}
 
         self._all_timeframes = [self.base_tf] + higher_tfs
         self._final_partial_emitted = False  # used only for finite-range mode
@@ -864,17 +864,18 @@ class AggregatorManager:
     # ---------- Public snapshot utilities ----------
     def preferred_snapshot_ts(self) -> Optional[int]:
         """Pick a monotonic event timestamp for a heartbeat snapshot."""
-        candidates: List[int] = []
+        best: Optional[int] = None
         base_open = self.base_agg.get_current_open_candle()
         if base_open:
-            candidates.append(int(base_open.timestamp))
+            best = base_open.timestamp
         for agg in self.higher_aggs:
             oc = agg.get_current_open_candle()
-            if oc:
-                candidates.append(int(oc.timestamp))
-        for rec in self.latest_closed_candles.values():
-            candidates.append(int(rec[1]))
-        return max(candidates) if candidates else None
+            if oc and (best is None or oc.timestamp > best):
+                best = oc.timestamp
+        for candle in self.latest_closed_candles.values():
+            if best is None or candle.timestamp > best:
+                best = candle.timestamp
+        return best
 
     def set_closure_source(self, source: CandleClosureSource) -> None:
         """Update the current source used when constructing CandleClosure objects."""
@@ -900,11 +901,10 @@ class AggregatorManager:
             return None
 
         # Closed = latest closed per TF where label_ts <= snapshot ts
-        closed_candles: Dict[str, Candle] = {}
-        for tf, rec in self.latest_closed_candles.items():
-            (tfid, lbl_ts, oo, hh, ll, cc, vv) = rec
-            if lbl_ts <= ts:
-                closed_candles[tf] = Candle(tfid, lbl_ts, oo, hh, ll, cc, vv)
+        closed_candles: Dict[str, Candle] = {
+            tf: candle for tf, candle in self.latest_closed_candles.items()
+            if candle.timestamp <= ts
+        }
 
         open_candles = self._current_open_candles()
 
@@ -935,17 +935,17 @@ class AggregatorManager:
                 agg.on_base_candle_closed(aggregator_closure_ts, o, h, l, c, vol)
 
         # Update "latest closed" and collect pending closure for this event_ts
-        rec = (tf, label_ts, o, h, l, c, vol)
-        self.latest_closed_candles[tf] = rec
+        candle = Candle(tf, label_ts, o, h, l, c, vol)
+        self.latest_closed_candles[tf] = candle
 
         if self._pending and self._pending[-1][0] == aggregator_closure_ts:
             # Merge into existing last bucket (only increment if tf is new to this bucket)
             if tf not in self._pending[-1][1]:
                 self._pending_tf_count += 1
-            self._pending[-1][1][tf] = rec
+            self._pending[-1][1][tf] = candle
         else:
             # Append new bucket (we deliberately keep simple ordered list)
-            self._pending.append((aggregator_closure_ts, {tf: rec}))
+            self._pending.append((aggregator_closure_ts, {tf: candle}))
             self._pending_tf_count += 1
 
         if self.debug_timing:
@@ -985,18 +985,14 @@ class AggregatorManager:
             open_candles = self._current_open_candles()
 
             # Start from the last emitted closed snapshot (ensures correct as-of semantics)
-            rolling_closed: Dict[str, Tuple[str, int, float, float, float, float, float]] = dict(self._last_emitted_closed_state)
+            rolling_closed: Dict[str, Candle] = dict(self._last_emitted_closed_state)
 
             for closure_ts, delta in self._pending:
                 # Apply the closures that happened at this event_ts
-                for tf, rec in delta.items():
-                    rolling_closed[tf] = rec
+                rolling_closed.update(delta)
 
-                # Freeze closed snapshot for this event_ts
-                closed_candles: Dict[str, Candle] = {
-                    tf: Candle(tfid, lbl_ts, oo, hh, ll, cc, vv)
-                    for tf, (tfid, lbl_ts, oo, hh, ll, cc, vv) in rolling_closed.items()
-                }
+                # Snapshot: copy dict of references (Candle objects are immutable-by-convention)
+                closed_candles: Dict[str, Candle] = dict(rolling_closed)
 
                 cc = CandleClosure(
                     timestamp=closure_ts,
@@ -1026,11 +1022,10 @@ class AggregatorManager:
         if ts is None:
             return []
 
-        closed_candles: Dict[str, Candle] = {}
-        for tf, rec in self.latest_closed_candles.items():
-            (tfid, lbl_ts, oo, hh, ll, cc, vv) = rec
-            if lbl_ts <= ts:
-                closed_candles[tf] = Candle(tfid, lbl_ts, oo, hh, ll, cc, vv)
+        closed_candles: Dict[str, Candle] = {
+            tf: candle for tf, candle in self.latest_closed_candles.items()
+            if candle.timestamp <= ts
+        }
         open_candles = self._current_open_candles()
 
         if not closed_candles and not open_candles:
@@ -1089,10 +1084,7 @@ class AggregatorManager:
                 if latest_open_ts is None or oc.timestamp > latest_open_ts:
                     latest_open_ts = oc.timestamp
             if partial_open_candles and latest_open_ts is not None:
-                final_closed_candles: Dict[str, Candle] = {}
-                for tf, rec in self.latest_closed_candles.items():
-                    (tfid, lbl_ts, oo, hh, ll, cc, vv) = rec
-                    final_closed_candles[tf] = Candle(tfid, lbl_ts, oo, hh, ll, cc, vv)
+                final_closed_candles: Dict[str, Candle] = dict(self.latest_closed_candles)
                 cc = CandleClosure(
                     timestamp=latest_open_ts,
                     closed_candles=final_closed_candles,
@@ -1196,7 +1188,7 @@ class CandleIterator:
             print(f"{INFO} Found {len(self.csv_file_paths)} data files for base timeframe: {self.cfg.base_timeframe}")
 
         self._candles_gen = self._load_candles_from_disk()
-        self._closed_buffer: List[CandleClosure] = []
+        self._closed_buffer: deque[CandleClosure] = deque()
         self._last_ts: Optional[int] = None
         self._last_close: Optional[float] = None
 
@@ -1228,6 +1220,7 @@ class CandleIterator:
         self._tail_size: int = 0
         self._tail_offset: int = 0  # byte offset where the next read will start from
         self._tail_backtrack_bytes: int = TAIL_BACKTRACK_BYTES
+        self._tail_last_line_len: int = 0  # length of last parsed line, for dynamic backtrack
 
     def __iter__(self) -> Iterator[CandleClosure]:
         return self
@@ -1235,7 +1228,7 @@ class CandleIterator:
     def __next__(self) -> CandleClosure:
         # Return buffered closures first (lowest latency)
         if self._closed_buffer:
-            return self._closed_buffer.pop(0)
+            return self._closed_buffer.popleft()
 
         while True:
             try:
@@ -1248,7 +1241,7 @@ class CandleIterator:
                         self._closed_buffer.extend(all_closures)
                         self._final_flush_done = True
                         if self._closed_buffer:
-                            return self._closed_buffer.pop(0)
+                            return self._closed_buffer.popleft()
                     raise StopIteration
 
                 # Live mode (no end_ts) with polling enabled: switch to polling
@@ -1275,14 +1268,14 @@ class CandleIterator:
 
                 # If the poll produced closures (from fresh rows), emit the first now.
                 if self._closed_buffer:
-                    return self._closed_buffer.pop(0)
+                    return self._closed_buffer.popleft()
 
                 # Otherwise, emit a single heartbeat snapshot immediately
                 snap_ts = self.manager.preferred_snapshot_ts()
                 snapshot = self.manager.build_snapshot_closure(event_ts=snap_ts)
                 if snapshot is not None:
                     self._closed_buffer.append(snapshot)
-                    return self._closed_buffer.pop(0)
+                    return self._closed_buffer.popleft()
 
                 # Nothing at all to emit; loop to next poll
                 continue
@@ -1290,7 +1283,7 @@ class CandleIterator:
             # Normal ingestion from file: process row and emit as soon as we have a closure
             self._ingest_row(row_ts, o, h, l, c, v)
             if self._closed_buffer:
-                return self._closed_buffer.pop(0)
+                return self._closed_buffer.popleft()
 
     # -----------------------------
     # Ingestion helpers
@@ -1466,8 +1459,13 @@ class CandleIterator:
                 # the file could rotate between these calls. This is handled by inode-based rotation
                 # detection on the next poll cycle (_ensure_tail_file_current checks inode/dev).
                 st = os.stat(path)
-                # Decide start offset (inclusive), with BACKTRACK for inclusive "same-ts" updates
-                start_offset = max(0, self._tail_offset - self._tail_backtrack_bytes)
+                # Dynamic backtrack: use smaller window in steady state based on last line length,
+                # falling back to full TAIL_BACKTRACK_BYTES on first poll or when no data seen yet.
+                if self._tail_last_line_len > 0:
+                    backtrack = min(self._tail_backtrack_bytes, self._tail_last_line_len * 2 + 256)
+                else:
+                    backtrack = self._tail_backtrack_bytes
+                start_offset = max(0, self._tail_offset - backtrack)
                 end_size = st.st_size
 
                 # Read bytes
@@ -1504,7 +1502,8 @@ class CandleIterator:
                         if not line:
                             continue
                         # Skip header if encountered (e.g., on rotation)
-                        if line.lower().startswith("timestamp"):
+                        # Fast pre-check on first char avoids lowercasing entire line
+                        if (line[0] == 't' or line[0] == 'T') and line[:9].lower() == "timestamp":
                             continue
                         parts = line.split(",")
                         if len(parts) < 6:
@@ -1523,6 +1522,7 @@ class CandleIterator:
 
                         drained_any = True
                         rows_scanned += 1
+                        self._tail_last_line_len = len(line)
                         if first_row_ts is None:
                             first_row_ts = ts
 
@@ -1724,6 +1724,7 @@ class CandleIterator:
             self._tail_size = size
             # On rotation, start from 0 to capture any rows in the new file (still cheap at day start)
             self._tail_offset = 0
+            self._tail_last_line_len = 0  # reset dynamic backtrack on rotation
             return candidate
 
         # Same file; detect truncation
@@ -1731,6 +1732,7 @@ class CandleIterator:
             # File shrank (rewrite) → restart from 0
             self._tail_size = size
             self._tail_offset = 0
+            self._tail_last_line_len = 0  # reset dynamic backtrack on truncation
             return candidate
 
         # Normal steady state
