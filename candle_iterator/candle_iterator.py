@@ -9,7 +9,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Iterator, Optional, Any
+from typing import Callable, List, Tuple, Dict, Iterator, Optional, Any
 from enum import Enum  # CandleClosureSource enum
 
 # ----------------------------------------------------------------------
@@ -34,7 +34,6 @@ INFO = Fore.GREEN + "[INFO]" + Style.RESET_ALL
 WARNING = Fore.YELLOW + "[WARNING]" + Style.RESET_ALL
 ERROR = Fore.RED + "[ERROR]" + Style.RESET_ALL
 SUCCESS = Fore.GREEN + "[SUCCESS]" + Style.RESET_ALL
-UPDATE = Fore.MAGENTA + "[UPDATE]" + Style.RESET_ALL
 
 COLOR_DIR = Fore.CYAN
 COLOR_FILE = Fore.YELLOW
@@ -1174,9 +1173,11 @@ class CandleIterator:
       This eliminates directory re-listing and full-file re-reading in steady state.
     """
 
-    def __init__(self, cfg: Config, manager: AggregatorManager):
+    def __init__(self, cfg: Config, manager: AggregatorManager, *,
+                 on_before_initial_resync: Optional[Callable] = None):
         self.cfg = cfg
         self.manager = manager
+        self._on_before_initial_resync = on_before_initial_resync
         self.data_path = os.path.expanduser(
             f"{cfg.data_dir}/{cfg.exchange}/candles/{cfg.ticker}/{cfg.base_timeframe}"
         )
@@ -1209,6 +1210,12 @@ class CandleIterator:
         # Hint to immediately re-drain (no sleep, no resync) if we advanced
         self._redrain_after_first_emission: bool = False
 
+        # Catch-up phase: after initial resync, closures stay HISTORICAL until
+        # the buffer drains.  The LIVE flip happens on the next __next__() call
+        # after the catch-up buffer is empty.
+        self._catchup_drain_pending: bool = False
+        self._poll_print_suppressed: bool = False
+
         # Timing diagnostics
         self.debug_timing: bool = _truthy_env(os.environ.get("CANDLES_SYNC_DEBUG_TIMING")) or bool(self.cfg.verbose)
         self._timing_prefix = Fore.CYAN + "[TIMING]" + Style.RESET_ALL
@@ -1230,6 +1237,11 @@ class CandleIterator:
         if self._closed_buffer:
             return self._closed_buffer.popleft()
 
+        # Catch-up buffer fully drained — transition to LIVE for all subsequent closures
+        if self._catchup_drain_pending:
+            self._catchup_drain_pending = False
+            self.manager.set_closure_source(CandleClosureSource.LIVE)
+
         while True:
             try:
                 row_ts, o, h, l, c, v = next(self._candles_gen)
@@ -1246,14 +1258,24 @@ class CandleIterator:
 
                 # Live mode (no end_ts) with polling enabled: switch to polling
                 if not self._polling_notice_emitted:
-                    self._announce_polling_mode()
-                    # Switch all subsequent closures to LIVE source
-                    self.manager.set_closure_source(CandleClosureSource.LIVE)
-                    # FIRST POLL: run immediately (no sleep), resync from remote,
-                    # and stop draining as soon as any real closure is produced.
+                    self._polling_notice_emitted = True
+                    # Fire the one-shot callback so the consumer can flush buffered
+                    # output before synchronize_candle_data() prints to stdout.
+                    if self._on_before_initial_resync is not None:
+                        self._on_before_initial_resync()
+                    # Suppress [candles-sync] output during catch-up resync —
+                    # consumer will print SCMR + announcement first.
+                    self._suppress_poll_print()
+                    # DON'T announce or flip to LIVE yet — catch-up closures stay HISTORICAL.
+                    # Consumer is responsible for printing the transition announcement.
+                    # FIRST POLL: drain ALL resynced rows (no early break) so the entire
+                    # catch-up backlog is tagged HISTORICAL.  Using stop_after_first_emission=False
+                    # avoids the redrain path which would run after the LIVE flip.
                     self._poll_for_new_data_and_buffer(
-                        sleep_first=False, resync=True, stop_after_first_emission=True
+                        sleep_first=False, resync=True, stop_after_first_emission=False
                     )
+                    # Mark catch-up drain pending — LIVE flip happens when buffer empties
+                    self._catchup_drain_pending = True
                 else:
                     # If prior cycle produced a strictly-new row, re-drain immediately (no sleep/resync)
                     if self._redrain_after_first_emission:
@@ -1365,18 +1387,31 @@ class CandleIterator:
         # Default: polling disabled unless explicitly enabled
         return None
 
-    def _announce_polling_mode(self) -> None:
-        """Print a single update when we transition from file iteration to polling mode."""
-        if self._polling_notice_emitted or self.poll_interval_seconds is None:
-            return
+    def restore_sync_logging(self) -> None:
+        """Public: consumer calls this after printing its transition announcement."""
+        self._restore_poll_print()
 
-        interval_s = self.poll_interval_seconds
-        tf = self.cfg.base_timeframe
-        print(
-            f"{UPDATE} Historical files exhausted — entering polling mode. "
-            f"Polling every {interval_s}s (base timeframe: {tf})."
-        )
-        self._polling_notice_emitted = True
+    def _suppress_poll_print(self) -> None:
+        """Suppress candles_sync.poll_print during the catch-up transition window."""
+        try:
+            import candles_sync.candles_sync as _cs_mod
+            self._orig_poll_print = getattr(_cs_mod, 'poll_print', None)
+            _cs_mod.poll_print = lambda msg: None
+            self._poll_print_suppressed = True
+        except Exception:
+            pass
+
+    def _restore_poll_print(self) -> None:
+        """Restore candles_sync.poll_print after catch-up transition."""
+        if not self._poll_print_suppressed:
+            return
+        try:
+            import candles_sync.candles_sync as _cs_mod
+            if self._orig_poll_print is not None:
+                _cs_mod.poll_print = self._orig_poll_print
+            self._poll_print_suppressed = False
+        except Exception:
+            pass
 
     def _poll_for_new_data_and_buffer(
         self,
@@ -1825,6 +1860,7 @@ def create_candle_iterator(
     data_dir: str = "~/.corky",
     verbose: bool = False,
     poll_interval_seconds: Optional[int] = None,
+    on_before_initial_resync: Optional[Callable] = None,
 ) -> Iterator[CandleClosure]:
     """
     Factory for CandleIterator. This version also injects a wrapper around
@@ -1986,7 +2022,7 @@ def create_candle_iterator(
         print(f"\n{ERROR} Synchronization failed for {base_timeframe}.\n")
         sys.exit(1)
 
-    return CandleIterator(cfg, manager)
+    return CandleIterator(cfg, manager, on_before_initial_resync=on_before_initial_resync)
 
 
 if __name__ == "__main__":
