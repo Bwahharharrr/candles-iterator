@@ -582,12 +582,19 @@ class CandleAggregator:
     - Guard against double-count in preview by ignoring a "partial" whose
       timestamp equals last finalized sub-timestamp.
     """
-    def __init__(self, timeframe: str, manager: 'AggregatorManager', is_base: bool = False, sub_factor: int = 1):
+    def __init__(self, timeframe: str, manager: 'AggregatorManager', is_base: bool = False, sub_factor: int = 1, anchor_offset_ms: int = 0):
         self.manager = manager
         self.tf = timeframe
         self.tf_ms = TIMEFRAMES[timeframe]
         self.is_base = is_base
         self.sub_factor = sub_factor
+
+        # Anchor offset for boundary alignment. Default 0 = epoch-aligned (legacy
+        # behavior: weeks fall on Thursdays because 1970-01-01 was Thursday).
+        # Non-zero values shift the boundary; e.g. -259_200_000 (3 days) aligns
+        # weekly boundaries to Monday 00:00 UTC for ISO-week semantics.
+        # Same unit as tf_ms; effectively reduced modulo tf_ms.
+        self.anchor_offset_ms = anchor_offset_ms
 
         # Rolling boundary state
         self.current_boundary: Optional[int] = None
@@ -608,6 +615,20 @@ class CandleAggregator:
         self.volume: float = 0.0
         self.sub_count: int = 0
         self.last_sub_ts: Optional[int] = None
+
+    # -----------------------------
+    # Boundary alignment
+    # -----------------------------
+    def _align_to_boundary(self, ts: int) -> int:
+        """Floor `ts` to this aggregator's boundary, respecting anchor_offset_ms.
+
+        With anchor_offset_ms == 0 (default), this is equivalent to the legacy
+        epoch-aligned floor `(ts // self.tf_ms) * self.tf_ms`.
+        With anchor_offset_ms != 0, the result is shifted so that boundaries
+        fall on multiples of tf_ms PLUS the offset — e.g. with tf_ms=604_800_000
+        and anchor_offset_ms=-259_200_000, boundaries are Monday 00:00 UTC.
+        """
+        return ((ts - self.anchor_offset_ms) // self.tf_ms) * self.tf_ms + self.anchor_offset_ms
 
     # -----------------------------
     # Base aggregator ingestion
@@ -643,7 +664,7 @@ class CandleAggregator:
         if self.last_sub_ts is not None and int(base_ts) == int(self.last_sub_ts):
             return  # avoid double-count preview
 
-        boundary = (base_ts // self.tf_ms) * self.tf_ms
+        boundary = self._align_to_boundary(base_ts)
         if self.current_boundary is None:
             self.current_boundary = boundary
 
@@ -658,7 +679,7 @@ class CandleAggregator:
         accumulation of closed base candles (volume_delta=True).
         """
         if self.current_boundary is None:
-            self.current_boundary = (base_ts // self.tf_ms) * self.tf_ms
+            self.current_boundary = self._align_to_boundary(base_ts)
 
         # Handle jumps across boundaries:
         while base_ts >= self.current_boundary + self.tf_ms:
@@ -788,7 +809,7 @@ class CandleAggregator:
         if not self.is_base and self._live_partial is not None:
             lp_ts = int(self._live_partial.ts)
             if self.last_sub_ts is None or lp_ts != int(self.last_sub_ts):
-                lp_boundary = (lp_ts // self.tf_ms) * self.tf_ms
+                lp_boundary = self._align_to_boundary(lp_ts)
                 if boundary_ts is None:
                     boundary_ts = lp_boundary
                     o = h = l = c = self._live_partial.o
@@ -827,16 +848,30 @@ class AggregatorManager:
       only when the next base interval row is observed.
     - Heartbeat snapshots are available at any time to show current open previews.
     """
-    def __init__(self, base_tf: str, higher_tfs: List[str], verbose: bool = False):
+    def __init__(self, base_tf: str, higher_tfs: List[str], verbose: bool = False,
+                 anchor_offsets: Optional[Dict[str, int]] = None):
+        """
+        anchor_offsets (optional): per-TF boundary offset in ms. Default None preserves
+        the legacy epoch-aligned behavior (weeks fall on Thursdays). Example for
+        ISO-week semantics (Monday-start): {"1W": -259_200_000}.
+        Same unit as tf_ms; effectively reduced modulo tf_ms per-TF.
+        Offset for the base TF and any TF not present in the dict defaults to 0.
+        """
         self.verbose = verbose
         self.base_tf = base_tf
-        self.base_agg = CandleAggregator(base_tf, manager=self, is_base=True)
+        self.anchor_offsets: Dict[str, int] = dict(anchor_offsets or {})
+
+        base_offset = self.anchor_offsets.get(base_tf, 0)
+        self.base_agg = CandleAggregator(base_tf, manager=self, is_base=True,
+                                          anchor_offset_ms=base_offset)
         self.higher_aggs: List[CandleAggregator] = []
 
         base_ms = TIMEFRAMES[base_tf]
         for tf in higher_tfs:
             factor = TIMEFRAMES[tf] // base_ms
-            agg = CandleAggregator(tf, manager=self, is_base=False, sub_factor=factor)
+            tf_offset = self.anchor_offsets.get(tf, 0)
+            agg = CandleAggregator(tf, manager=self, is_base=False, sub_factor=factor,
+                                    anchor_offset_ms=tf_offset)
             self.higher_aggs.append(agg)
 
         # Snapshots of latest closed by TF (stored as Candle objects directly)
@@ -1861,6 +1896,7 @@ def create_candle_iterator(
     verbose: bool = False,
     poll_interval_seconds: Optional[int] = None,
     on_before_initial_resync: Optional[Callable] = None,
+    anchor_offsets: Optional[Dict[str, int]] = None,
 ) -> Iterator[CandleClosure]:
     """
     Factory for CandleIterator. This version also injects a wrapper around
@@ -1957,7 +1993,8 @@ def create_candle_iterator(
 
     # --- Build manager and config ---
     higher_tfs = [t for t in parsed_tfs if t != base_timeframe]
-    manager = AggregatorManager(base_timeframe, higher_tfs, verbose=verbose)
+    manager = AggregatorManager(base_timeframe, higher_tfs, verbose=verbose,
+                                 anchor_offsets=anchor_offsets)
 
     cfg = Config(
         exchange=exchange,
