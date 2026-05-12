@@ -849,17 +849,27 @@ class AggregatorManager:
     - Heartbeat snapshots are available at any time to show current open previews.
     """
     def __init__(self, base_tf: str, higher_tfs: List[str], verbose: bool = False,
-                 anchor_offsets: Optional[Dict[str, int]] = None):
+                 anchor_offsets: Optional[Dict[str, int]] = None,
+                 force_close_final: bool = False):
         """
         anchor_offsets (optional): per-TF boundary offset in ms. Default None preserves
         the legacy epoch-aligned behavior (weeks fall on Thursdays). Example for
         ISO-week semantics (Monday-start): {"1W": -259_200_000}.
         Same unit as tf_ms; effectively reduced modulo tf_ms per-TF.
         Offset for the base TF and any TF not present in the dict defaults to 0.
+
+        force_close_final (optional): when True, flush() will force-close the BASE
+        timeframe's currently-open candle as if a subsequent bar had arrived. This
+        lets end-of-data runs (e.g. a daily-equity scan after market close) fire
+        alerts on the latest bar instead of waiting for the next trading day's
+        bar to arrive. Higher TFs are NOT force-closed — they follow normal
+        sub_factor / boundary-jump rules. Default False preserves the legacy
+        "no force-close on wall-clock" behavior.
         """
         self.verbose = verbose
         self.base_tf = base_tf
         self.anchor_offsets: Dict[str, int] = dict(anchor_offsets or {})
+        self.force_close_final = force_close_final
 
         base_offset = self.anchor_offsets.get(base_tf, 0)
         self.base_agg = CandleAggregator(base_tf, manager=self, is_base=True,
@@ -1086,9 +1096,53 @@ class AggregatorManager:
     def flush(self) -> List[CandleClosure]:
         """
         Emit any pending finalized closures and one last partial snapshot.
-        IMPORTANT: We do **not** force-close the base TF on wall-clock time.
+
+        IMPORTANT: By default we do **not** force-close the base TF on wall-clock
+        time. When `force_close_final=True` was passed to the manager, this
+        method DOES force-close the base TF's currently-open candle as if a
+        subsequent bar had arrived. This is opt-in for end-of-data scans where
+        the operator knows the latest bar is genuinely complete (e.g. cron
+        running 30 min after US market close).
         """
         out: List[CandleClosure] = []
+
+        # Force-close the BASE TF's open candle when explicitly enabled.
+        # This must run BEFORE the higher-TF block below so that any propagated
+        # sub_factor completions are handled by the normal record_closure path.
+        # Higher TFs are intentionally NOT force-closed here — they follow the
+        # standard sub_factor / boundary-jump rules.
+        if self.force_close_final and self.base_agg.open_ts is not None:
+            # event_ts: "when did we detect the close". Prefer last_sub_ts
+            # (the last real input that contributed to this bar), then
+            # current_boundary, then open_ts as a last-resort identity value.
+            # We avoid 0 because it would inject a meaningless epoch timestamp
+            # into downstream consumers that key on closure event time.
+            event_ts = (
+                self.base_agg.last_sub_ts
+                if self.base_agg.last_sub_ts is not None
+                else self.base_agg.current_boundary
+                if self.base_agg.current_boundary is not None
+                else self.base_agg.open_ts
+            )
+            # _finalize_aggregator_candle is idempotent (early-returns if
+            # open_ts is None) and uses self.open_ts as label_ts inside
+            # record_closure. record_closure propagates to higher TFs via
+            # on_base_candle_closed, so a force-closed base bar that completes
+            # a higher TF's sub_factor will correctly cascade.
+            self.base_agg._finalize_aggregator_candle(real_event_ts=event_ts)
+            # Clear the base aggregator's open state. We deliberately do NOT
+            # call _seed_next_open — there is no next bar coming.
+            self.base_agg._clear_open_state()
+            # ALSO clear any pre-existing seeded next-open. During normal bar
+            # ingestion, _consume_subcandle calls _seed_next_open after every
+            # bar transition (line ~670), so a "next bar opens here" hint is
+            # set on the base aggregator after every real bar. Without this
+            # cleanup, get_current_open_candle would still return a seeded
+            # preview candle, putting the base TF back into open_candles
+            # snapshots — defeating the contract that the force-closed bar
+            # has been MOVED to closed_candles.
+            self.base_agg._seed_next_open_ts = None
+            self.base_agg._seed_next_open_price = None
 
         # If higher TFs already have enough subs, allow them to finalize (logical completion)
         for agg in self.higher_aggs:
@@ -1897,6 +1951,7 @@ def create_candle_iterator(
     poll_interval_seconds: Optional[int] = None,
     on_before_initial_resync: Optional[Callable] = None,
     anchor_offsets: Optional[Dict[str, int]] = None,
+    force_close_final: bool = False,
 ) -> Iterator[CandleClosure]:
     """
     Factory for CandleIterator. This version also injects a wrapper around
@@ -1994,7 +2049,8 @@ def create_candle_iterator(
     # --- Build manager and config ---
     higher_tfs = [t for t in parsed_tfs if t != base_timeframe]
     manager = AggregatorManager(base_timeframe, higher_tfs, verbose=verbose,
-                                 anchor_offsets=anchor_offsets)
+                                 anchor_offsets=anchor_offsets,
+                                 force_close_final=force_close_final)
 
     cfg = Config(
         exchange=exchange,
