@@ -58,6 +58,12 @@ TAIL_BACKTRACK_BYTES: int = 4096  # re-parse this many trailing bytes every poll
 # 10 in a row is a strong signal of upstream corruption or schema desync.
 _TAIL_MALFORMED_RESYNC_THRESHOLD: int = 10
 
+# P2-2: TTL for the rollover-gap fallback cache. During the rollover-gap
+# window (between expected partition rollover and actual file appearance),
+# we cache the fallback path so we don't re-listdir() every poll. Cleared
+# the moment the expected current-partition path appears.
+_FALLBACK_CACHE_TTL_SECS: float = 30.0
+
 # Fast-append patch toggles
 FAST_APPEND_DISABLE_ENV: str = "CANDLES_SYNC_DISABLE_FAST_APPEND"
 FAST_APPEND_HEADER: Tuple[str, ...] = ("timestamp", "open", "close", "high", "low", "volume")
@@ -212,15 +218,34 @@ def _read_last_row_timestamp(csv_path: str) -> Optional[int]:
         return None
 
 
-def _truncate_last_line(csv_path: str) -> bool:
+def _truncate_last_line(csv_path: str, *, validate_candle_row: bool = False) -> bool:
     """
     Truncate the file to remove the last line (including its newline if present).
-    This is used for a tiny tail de-dup when the incoming chunk's first timestamp
-    equals the last on-disk timestamp.
+
+    Production code routes through `partition_writer.write_batch` (which
+    implements `_strip_last_data_row` with built-in validation). This helper
+    is kept for backward compatibility and is exercised by P0-8 tests.
+
+    P2-4: when `validate_candle_row=True`, the last line is read first and
+    must parse as a valid candle row (6 numeric fields). If validation
+    fails, the helper REFUSES to truncate (returns False) and logs a warning.
+    Default is False to preserve the original generic line-truncator
+    semantics that legacy tests rely on.
     """
     try:
         if not os.path.exists(csv_path):
             return False
+        # P2-4: optional pre-truncate validation
+        if validate_candle_row:
+            last = _read_last_data_line_bytes(csv_path)
+            if last is None or not _is_candle_row_bytes(last):
+                detail = repr(last[:80]) if last else "EMPTY"
+                print(
+                    f"{WARNING} _truncate_last_line: refusing to truncate "
+                    f"non-candle-row last line in {csv_path}: {detail}"
+                    f"{Style.RESET_ALL}"
+                )
+                return False
         with open(csv_path, "rb+") as f:
             f.seek(0, os.SEEK_END)
             end = f.tell()
@@ -247,6 +272,43 @@ def _truncate_last_line(csv_path: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _read_last_data_line_bytes(csv_path: str) -> Optional[bytes]:
+    """Return the last non-empty, non-header line as raw bytes."""
+    try:
+        size = os.path.getsize(csv_path)
+        if size == 0:
+            return None
+        with open(csv_path, "rb") as f:
+            f.seek(-min(8192, size), os.SEEK_END)
+            data = f.read()
+        lines = [ln for ln in data.split(b"\n") if ln]
+        for ln in reversed(lines):
+            if ln[:1] in (b"t", b"T") and ln[:9].lower() == b"timestamp":
+                continue
+            return ln
+        return None
+    except OSError:
+        return None
+
+
+def _is_candle_row_bytes(line: bytes) -> bool:
+    """True if line is exactly 6 numeric fields (timestamp + 5 floats)."""
+    if not line:
+        return False
+    if line[:1] in (b"t", b"T") and line[:9].lower() == b"timestamp":
+        return False
+    parts = line.split(b",")
+    if len(parts) != 6:
+        return False
+    try:
+        int(parts[0])
+        for p in parts[1:]:
+            float(p)
+    except (ValueError, IndexError):
+        return False
+    return True
 
 
 def _canonicalize_input_df(df: Any) -> Optional[Any]:
@@ -289,15 +351,18 @@ def _canonicalize_input_df(df: Any) -> Optional[Any]:
     try:
         work = df.rename(columns=rename)
         work = work[list(FAST_APPEND_HEADER)]  # enforce order
+        # P2-1: drop NaN timestamps BEFORE astype('int64'), which would
+        # otherwise raise on NaN and trigger the broad except below.
+        work = work.dropna(subset=["timestamp"])
+        if work.empty:
+            return None
         # Dtypes
         work["timestamp"] = work["timestamp"].astype("int64")
         for col in ("open", "close", "high", "low", "volume"):
             work[col] = work[col].astype("float64")
         # Self-dedup on timestamp (keep last), then sort ascending
-        work = work.dropna(subset=["timestamp"])
         work = work.drop_duplicates(subset=["timestamp"], keep="last")
         work = work.sort_values("timestamp", kind="mergesort").reset_index(drop=True)
-        # Ensure monotonic non-decreasing timestamps
         if work.empty:
             return None
         return work
@@ -1375,6 +1440,10 @@ class CandleIterator:
         # Set transiently when _force_tail_resync runs; checked at end of poll
         # to skip the unconditional EOF-advance that would undo the reset.
         self._tail_resync_pending: bool = False
+        # P2-2: rollover-gap fallback cache (monotonic timestamp + path).
+        # Cleared on successful current-partition detection.
+        self._fallback_cache_path: Optional[str] = None
+        self._fallback_cache_ts: float = 0.0
 
     def __iter__(self) -> Iterator[CandleClosure]:
         return self
@@ -1696,7 +1765,15 @@ class CandleIterator:
                     else:
                         text = ""  # all partial; wait for next poll
 
-                # Parse lines
+# Parse lines.
+                # P2-5 invariant: the tail parser splits on `,` naively (no
+                # csv-reader). This is safe because FAST_APPEND_HEADER
+                # guarantees all 6 fields are numeric (no quoted strings, no
+                # embedded commas). The upstream writer (candles_sync) is also
+                # numeric-only, so this invariant holds end-to-end. If a
+                # foreign tool ever writes a CSV with quoted fields, the
+                # parser will mis-split — but the foreign-tool path also
+                # isn't supported by the rest of the writer protocol.
                 t0_parse = _time.perf_counter()
                 if text:
                     lines = text.splitlines()
@@ -1928,17 +2005,33 @@ class CandleIterator:
         now_dt = datetime.now(timezone.utc)
         candidate = os.path.join(self.data_path, self._current_partition_basename(now_dt))
 
-        # If the candidate doesn't exist yet (very early after rollover), try the most recent existing file once.
+        # If the candidate doesn't exist yet (very early after rollover), try
+        # the most recent existing file. P2-2: cache the result for a short
+        # TTL so we don't re-listdir every poll during the rollover-gap.
         if not os.path.exists(candidate):
-            # Fallback: choose the last file from the initial listing (safe, rare)
-            try:
-                files = self._list_csv_files()
-                if files:
-                    candidate = files[-1]
-            except Exception as exc:
-                if self.cfg.verbose:
-                    print(f"{WARNING} _ensure_tail_file_current fallback failed: {exc}{Style.RESET_ALL}")
-                return None
+            now = time.monotonic()
+            cached = self._fallback_cache_path
+            cache_age = now - self._fallback_cache_ts
+            if (cached is not None
+                    and cache_age < _FALLBACK_CACHE_TTL_SECS
+                    and os.path.exists(cached)):
+                candidate = cached
+            else:
+                try:
+                    files = self._list_csv_files()
+                    if files:
+                        candidate = files[-1]
+                        self._fallback_cache_path = candidate
+                        self._fallback_cache_ts = now
+                except Exception as exc:
+                    if self.cfg.verbose:
+                        print(f"{WARNING} _ensure_tail_file_current fallback failed: {exc}{Style.RESET_ALL}")
+                    return None
+        else:
+            # Current partition exists — clear stale fallback cache so a
+            # future rollover gap starts fresh.
+            self._fallback_cache_path = None
+            self._fallback_cache_ts = 0.0
 
         if not os.path.exists(candidate):
             return None
@@ -2017,7 +2110,7 @@ class CandleIterator:
                 break
             if self.cfg.verbose:
                 print(f"{INFO} Reading file: {csv_path}")
-            with open(csv_path, "r", encoding="utf-8") as f:
+            with open(csv_path, "r", encoding="utf-8-sig") as f:
                 reader = csv.reader(f)
                 for row in reader:
                     if reached_end:
@@ -2053,7 +2146,7 @@ class CandleIterator:
         for csv_path in file_list:
             if self.cfg.verbose:
                 print(f"{INFO} (hist) Reading file: {csv_path}")
-            with open(csv_path, "r", encoding="utf-8") as f:
+            with open(csv_path, "r", encoding="utf-8-sig") as f:
                 reader = csv.reader(f)
                 for row in reader:
                     if not row or len(row) < 6:

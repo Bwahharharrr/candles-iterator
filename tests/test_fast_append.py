@@ -254,10 +254,9 @@ class TestCanonicalizeInputDf:
         row_1000 = result[result["timestamp"] == 1000].iloc[0]
         assert row_1000["open"] == 99.0
 
-    def test_nan_timestamps_cause_astype_failure_returns_none(self, capsys):
-        """NaN in `timestamp` makes the `astype('int64')` call (line 238)
-        raise BEFORE the dropna step (line 242). The exception is caught and
-        the function returns None — pinning this existing behavior.
+    def test_nan_timestamps_dropped_then_valid_rows_kept(self, capsys):
+        """P2-1 reorder: dropna runs BEFORE astype('int64'), so NaN ts rows
+        are silently dropped and the remaining valid rows are kept and typed.
         """
         df = pd.DataFrame({
             "timestamp": [1000, None, 2000],
@@ -267,9 +266,15 @@ class TestCanonicalizeInputDf:
             "low": [0.5, 1.5, 2.5],
             "volume": [10.0, 20.0, 30.0],
         })
-        assert _canonicalize_input_df(df) is None
+        result = _canonicalize_input_df(df)
+        assert result is not None
+        # NaN dropped; 2 valid rows remain
+        assert len(result) == 2
+        assert list(result["timestamp"]) == [1000, 2000]
+        assert result["timestamp"].dtype == "int64"
+        # No exception → no failure warning
         captured = capsys.readouterr()
-        assert "_canonicalize_input_df failed" in captured.out
+        assert "_canonicalize_input_df failed" not in captured.out
 
     def test_dtypes_enforced(self):
         df = pd.DataFrame({
@@ -301,10 +306,11 @@ class TestCanonicalizeInputDf:
         assert "EXTRA" not in result.columns
         assert list(result.columns) == list(FAST_APPEND_HEADER)
 
-    def test_all_nan_timestamps_returns_none(self):
-        """All-NaN `timestamp` column: astype('int64') raises before dropna,
-        function returns None via the except branch. Pinning current
-        astype-before-dropna sequence.
+    def test_all_nan_timestamps_returns_none(self, capsys):
+        """All-NaN `timestamp` column: P2-1 reorder means dropna fires FIRST,
+        leaving an empty df → return None via the clean empty-after-dropna
+        path. NO warning emitted (the previous astype-failure path produced
+        a warning; now the path is graceful).
         """
         df = pd.DataFrame({
             "timestamp": [None, None],
@@ -315,6 +321,9 @@ class TestCanonicalizeInputDf:
             "volume": [10.0, 20.0],
         })
         assert _canonicalize_input_df(df) is None
+        # P2-1: no warning printed because no exception was raised
+        captured = capsys.readouterr()
+        assert "_canonicalize_input_df failed" not in captured.out
 
     def test_truly_empty_dataframe_returns_none(self):
         """An empty DataFrame (zero rows) with all required columns:
