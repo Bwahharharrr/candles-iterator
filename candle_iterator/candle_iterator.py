@@ -60,6 +60,28 @@ FAST_APPEND_HEADER: Tuple[str, ...] = ("timestamp", "open", "close", "high", "lo
 # Pre-compiled regex for relational timeframe expressions (e.g., ">=1h", "<4h")
 _RELATION_RE = re.compile(r"^(<=|>=|<|>)([0-9]+[mhDWhd]+)$")
 
+# P1-1: Only these base timeframes have partition basename + regex mappings.
+# Other TFs would silently mismatch the on-disk layout written by candles_sync.
+SUPPORTED_BASE_TIMEFRAMES: Tuple[str, ...] = ("1m", "1h", "1D")
+
+
+def _validate_path_component(name: str, value: Any) -> None:
+    """Reject inputs that would escape the data root or break path joining.
+
+    P1-3: validates `exchange`, `ticker`, `base_timeframe` before they are
+    joined into the data path.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be a non-empty string")
+    # Bare "." and ".." are path traversal; "foo..bar" is harmless (since "/"
+    # and "\\" are rejected separately).
+    if value in (".", ".."):
+        raise ValueError(f"{name} must not be '.' or '..' (path traversal)")
+    if "/" in value or "\\" in value:
+        raise ValueError(f"{name} must not contain path separators")
+    if "\0" in value:
+        raise ValueError(f"{name} must not contain null bytes")
+
 # ----------------------------------------------------------------------
 # 2) LOCAL IMPORT: SYNCHRONIZE FUNCTION
 # ----------------------------------------------------------------------
@@ -263,7 +285,10 @@ def _append_rows(csv_path: str, df: Any, *, include_header: bool) -> None:
 
     mode = "a" if os.path.exists(csv_path) else "w"
     with open(csv_path, mode, encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
+        # P1-4: force \n line endings for cross-platform consistency. Default
+        # csv.writer dialect uses \r\n, which can mix with the \n that
+        # _ensure_trailing_newline writes elsewhere.
+        writer = csv.writer(f, lineterminator="\n")
         if include_header:
             writer.writerow(list(FAST_APPEND_HEADER))
         # df is canonicalized; iterate without index
@@ -1961,11 +1986,32 @@ def create_candle_iterator(
       - verbose=True
     """
 
-    # --- Validate paths and timeframes ---
+    # --- Validate inputs (P1-2/P1-3: before any path construction) ---
+    _validate_path_component("exchange", exchange)
+    _validate_path_component("ticker", ticker)
+    _validate_path_component("base_timeframe", base_timeframe)
+
+    # P1-2: detect ~ expansion failure (e.g., $HOME unset under cron/container)
+    if isinstance(data_dir, str) and data_dir.startswith("~"):
+        if os.path.expanduser(data_dir) == data_dir:
+            raise ValueError(
+                f"data_dir={data_dir!r} requires home-directory expansion, "
+                f"but no home directory is available in this environment. "
+                f"Pass an explicit absolute data_dir, or set $HOME."
+            )
+
     exchange = exchange.upper()
 
     if base_timeframe not in TIMEFRAMES:
         raise ValueError(f"Invalid base timeframe: {base_timeframe}")
+
+    # P1-1: only 1m/1h/1D have partition basename + regex mappings
+    if base_timeframe not in SUPPORTED_BASE_TIMEFRAMES:
+        raise ValueError(
+            f"Unsupported base_timeframe {base_timeframe!r}; partition naming "
+            f"only supports {sorted(SUPPORTED_BASE_TIMEFRAMES)}. The on-disk "
+            f"layout is fixed by candles_sync's partition scheme."
+        )
 
     parsed_tfs = parse_aggregation_timeframes(aggregation_timeframes)
     if not parsed_tfs:

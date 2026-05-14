@@ -43,8 +43,11 @@ class TestInvalidBaseTimeframe:
             )
 
     def test_empty_base_tf_raises(self, tmp_path, monkeypatch):
+        """Empty base_timeframe is rejected by the path-component validator
+        before the TIMEFRAMES check fires (Phase 2 hardening).
+        """
         _stub_sync(monkeypatch)
-        with pytest.raises(ValueError, match="Invalid base timeframe"):
+        with pytest.raises(ValueError, match="non-empty"):
             create_candle_iterator(
                 exchange="EODHD", ticker="TEST.US",
                 base_timeframe="", aggregation_timeframes=["1m"],
