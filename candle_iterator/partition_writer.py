@@ -9,10 +9,20 @@ Closes P0-1..P0-5 of the file-robustness plan:
     literal atomic append — see note below).
 
 Atomicity profile (honest framing):
-  - "created" and "replaced_last" paths are atomic (single os.replace).
-  - "appended" path is ROBUST: short-write tolerant, EINTR-tolerant, and any
+  - "replaced_last" is the only TRULY atomic path: writes a unique tmp file
+    in the same directory, fsyncs, then `os.replace(tmp, csv_path)` makes
+    the swap atomic.
+  - "created" uses `O_TRUNC | O_CREAT` + `_write_all`. It is robust to
+    short-writes and EINTR, but readers can observe partial state between
+    the truncate and the final byte of `_write_all`. A crash mid-write is
+    repaired on the next call via `_repair_incomplete_tail`.
+  - "appended" is ROBUST: short-write tolerant, EINTR-tolerant, and any
     crash-window partial trailing bytes are repaired on the next call's
     tail-repair step (idempotent, self-healing). Not literal atomic append.
+
+  All non-atomic paths are protected by the partition lock (so no two
+  writers race) and by `_repair_incomplete_tail` (so any partial trailing
+  bytes from a prior crash are removed before the next decision).
 
 Scope: this writer is specific to candle partition CSV files with the schema
 `FAST_APPEND_HEADER = (timestamp, open, close, high, low, volume)` where all
