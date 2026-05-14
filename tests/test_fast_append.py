@@ -495,11 +495,10 @@ class TestFastAppendWrapper:
         assert text.count("timestamp,open,close,high,low,volume") == 1
 
     def test_existing_header_only_file_treated_as_new_write(self, tmp_path):
-        """File with header only and no data rows → last_ts is None → wrapper
-        takes the new-file path (writes header + rows). The existing header
-        gets appended-to (creating a duplicate header line). Pin this:
-        the wrapper does NOT special-case the header-only existing-file
-        scenario.
+        """File with header only and no data rows → last_ts is None → the
+        atomic partition_writer takes the "created" path which O_TRUNCs the
+        file and writes a single header + rows. Improvement over the old
+        wrapper which produced a duplicate header.
         """
         wrapper, original = self._make_wrapper()
         p = tmp_path / "x.csv"
@@ -508,11 +507,9 @@ class TestFastAppendWrapper:
         wrapper(str(p), df=df)
         assert original._calls == []
         text = p.read_text()
-        # Both: the original header + a second header written by the
-        # new-file path (last_ts is None → include_header=True).
-        # Pinning the current behavior — note this is a slight inefficiency
-        # but does not corrupt data (consumers must skip header rows).
-        assert text.count("timestamp,open,close,high,low,volume") == 2
+        # Single header (the old quirk that produced two headers has been
+        # fixed by partition_writer's O_TRUNC on the created path).
+        assert text.count("timestamp,open,close,high,low,volume") == 1
         assert "1000," in text
 
     def test_overlap_backfill_leaves_file_unchanged(self, tmp_path):
@@ -541,11 +538,13 @@ class TestFastAppendWrapper:
             "timestamp,open,close,high,low,volume\n"
             "2000,2.0,2.5,3.0,1.5,20.0\n"
         )
-        # Incoming first ts < last on-disk ts → delegate
+        # Incoming first ts < last on-disk ts → delegate via partition_writer
         df = _mk_df([(1000, 1.0, 1.5, 2.0, 0.5, 10.0)])
         ret = wrapper(str(p), df=df)
+        # Original was invoked (under the partition lock); wrapper returns None
+        # consistently (mimicking what most write_partition impls return).
         assert len(original._calls) == 1
-        assert ret == "original_return"
+        assert ret is None
 
     def test_exception_in_wrapper_falls_back(self, tmp_path, monkeypatch, capsys):
         """Force _canonicalize_input_df to raise — wrapper should print and

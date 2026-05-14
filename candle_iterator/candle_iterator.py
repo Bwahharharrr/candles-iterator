@@ -308,52 +308,45 @@ def _extract_path_and_df(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple
 
 def _fast_write_partition_wrapper_factory(original_write_fn: Any):
     """
-    Produce a wrapper that implements:
-      - Append-only fast path when incoming timestamps > last on-disk timestamp.
-      - Tiny tail de-dup when incoming min ts == last on-disk ts (truncate last line, then append).
-      - Fallback to original write on overlap/backfill (incoming min ts < last on-disk ts) or any error.
+    Produce a wrapper that routes writes through the atomic partition_writer
+    module when possible, falling back to the original (slow merge) writer
+    for pre-write setup failures and for overlap/backfill writes.
+
+    Pre-write errors (extract / canonicalize) still fall back to the original
+    writer (safe — no on-disk mutation yet). Errors INSIDE the partition
+    writer (during the actual write, under the lock) are surfaced to the
+    caller per the P0-3 contract — DO NOT delegate after a partial write.
     """
     def _wrapped_write(*args: Any, **kwargs: Any) -> Any:
         # Allow users to disable the optimization via ENV for any reason.
         if _truthy_env(os.environ.get(FAST_APPEND_DISABLE_ENV)):
             return original_write_fn(*args, **kwargs)
 
+        # ---- Pre-write setup (may safely fall back on error) ----
         try:
             csv_path, df = _extract_path_and_df(args, kwargs)
             if not csv_path or df is None:
-                # Can't reason about inputs; delegate.
                 return original_write_fn(*args, **kwargs)
 
             canon_df = _canonicalize_input_df(df)
             if canon_df is None or len(canon_df) == 0:
                 return original_write_fn(*args, **kwargs)
-
-            last_ts = _read_last_row_timestamp(csv_path)
-            first_incoming_ts = int(canon_df["timestamp"].iloc[0])
-
-            # New file or empty file: write header + all rows
-            if last_ts is None or _file_size(csv_path) == 0:
-                _append_rows(csv_path, canon_df, include_header=True)
-                # Most write_partition implementations return None; mimic that.
-                return None
-
-            # Append-only fast path (strictly greater) OR tiny same-ts replace
-            if first_incoming_ts > last_ts:
-                _append_rows(csv_path, canon_df, include_header=False)
-                return None
-
-            if first_incoming_ts == last_ts:
-                # Replace the final line once, then append the canonicalized chunk
-                _truncate_last_line(csv_path)
-                _append_rows(csv_path, canon_df, include_header=False)
-                return None
-
-            # Overlap/backfill: fall back to original full-merge implementation
-            return original_write_fn(*args, **kwargs)
         except Exception as exc:
-            # On any unexpected issue, defer to the original implementation.
-            print(f"{WARNING} fast-append wrapper failed ({exc}), falling back to original writer{Style.RESET_ALL}")
+            print(
+                f"{WARNING} fast-append wrapper failed ({exc}), falling back "
+                f"to original writer{Style.RESET_ALL}"
+            )
             return original_write_fn(*args, **kwargs)
+
+        # ---- Atomic write via partition_writer (no fallback on partial write) ----
+        # Import here to avoid circular import at module load
+        from . import partition_writer as _pw
+        _pw.write_batch(
+            csv_path, canon_df,
+            fallback_fn=original_write_fn,
+            fallback_args=args, fallback_kwargs=kwargs,
+        )
+        return None
 
     setattr(_wrapped_write, "_fast_append_installed", True)
     return _wrapped_write
