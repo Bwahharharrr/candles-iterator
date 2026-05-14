@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import errno
 import os
 import re
 import sys
@@ -52,6 +53,10 @@ DEFAULT_BACKOFF_BARS: int = 200     # number of bars to back off when no start d
 
 # Tail-follow constants
 TAIL_BACKTRACK_BYTES: int = 4096  # re-parse this many trailing bytes every poll
+# P1-8: number of consecutive malformed rows in a single poll before forcing
+# a full resync (offset -> 0). Justified: real files have very few bad bytes;
+# 10 in a row is a strong signal of upstream corruption or schema desync.
+_TAIL_MALFORMED_RESYNC_THRESHOLD: int = 10
 
 # Fast-append patch toggles
 FAST_APPEND_DISABLE_ENV: str = "CANDLES_SYNC_DISABLE_FAST_APPEND"
@@ -104,13 +109,27 @@ def _ensure_parent_dir(path: str) -> None:
 
 
 def _file_size(path: str) -> int:
+    """Return file size in bytes; 0 for missing or unreadable files.
+
+    P1-7: narrowed to OSError. ENOENT (missing) is a normal "return 0" case;
+    EACCES / EROFS / ENOSPC indicate config problems and are logged.
+    """
     try:
         return os.path.getsize(path)
-    except Exception:
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+            print(
+                f"{WARNING} _file_size({path}) failed: {exc} "
+                f"(errno={exc.errno}){Style.RESET_ALL}"
+            )
         return 0
 
 
 def _file_ends_with_newline(path: str) -> bool:
+    """True if file ends with `\\n`, is missing, or is empty.
+
+    P1-7: narrowed to OSError. Same logging policy as _file_size.
+    """
     try:
         size = os.path.getsize(path)
         if size <= 0:
@@ -118,18 +137,32 @@ def _file_ends_with_newline(path: str) -> bool:
         with open(path, "rb") as f:
             f.seek(-1, os.SEEK_END)
             return f.read(1) == b"\n"
-    except Exception:
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+            print(
+                f"{WARNING} _file_ends_with_newline({path}) failed: {exc} "
+                f"(errno={exc.errno}){Style.RESET_ALL}"
+            )
         return True
 
 
 def _ensure_trailing_newline(path: str) -> None:
+    """Append a `\\n` if the file has data but doesn't end with one.
+
+    P1-7: narrowed to OSError; surfaces unexpected errno values via logging.
+    Functional behavior unchanged (failures are non-fatal — worst case is
+    that rows are appended right after the last byte).
+    """
     try:
         if os.path.exists(path) and os.path.getsize(path) > 0 and not _file_ends_with_newline(path):
             with open(path, "ab") as f:
                 f.write(b"\n")
-    except Exception:
-        # Non-fatal; worst case is rows are appended right after last byte.
-        pass
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+            print(
+                f"{WARNING} _ensure_trailing_newline({path}) failed: {exc} "
+                f"(errno={exc.errno}){Style.RESET_ALL}"
+            )
 
 
 def _read_last_row_timestamp(csv_path: str) -> Optional[int]:
@@ -1331,10 +1364,17 @@ class CandleIterator:
         self._tail_file_path: Optional[str] = None
         self._tail_inode: Optional[int] = None
         self._tail_dev: Optional[int] = None
+        self._tail_ctime_ns: Optional[int] = None  # P1-5 diagnostic only (NOT a rotation trigger)
         self._tail_size: int = 0
         self._tail_offset: int = 0  # byte offset where the next read will start from
         self._tail_backtrack_bytes: int = TAIL_BACKTRACK_BYTES
         self._tail_last_line_len: int = 0  # length of last parsed line, for dynamic backtrack
+        # P1-8: tail health counter — N consecutive malformed rows OR mid-file
+        # header forces a full resync (offset → 0) and logs the reason.
+        self._tail_malformed_count: int = 0
+        # Set transiently when _force_tail_resync runs; checked at end of poll
+        # to skip the unconditional EOF-advance that would undo the reset.
+        self._tail_resync_pending: bool = False
 
     def __iter__(self) -> Iterator[CandleClosure]:
         return self
@@ -1520,6 +1560,26 @@ class CandleIterator:
         except Exception:
             pass
 
+    def _force_tail_resync(self, *, reason: str, detail: str = "") -> None:
+        """P1-8: reset tail offset to 0 and log the reason.
+
+        Used when content evidence indicates the tail is out of sync (mid-file
+        header, sustained malformed rows). The next poll re-parses from offset
+        0 and the malformed counter is reset to avoid warning loops.
+
+        Sets `_tail_resync_pending` so the current poll's post-loop offset
+        advance is skipped — without this, the unconditional EOF-advance at
+        the end of `_poll_for_new_data_and_buffer` would overwrite our reset.
+        """
+        msg = f"{WARNING} tail-follow force-resync ({reason})"
+        if detail:
+            msg += f": {detail}"
+        print(f"{msg}{Style.RESET_ALL}")
+        self._tail_offset = 0
+        self._tail_last_line_len = 0
+        self._tail_malformed_count = 0
+        self._tail_resync_pending = True
+
     def _poll_for_new_data_and_buffer(
         self,
         *,
@@ -1640,15 +1700,39 @@ class CandleIterator:
                 t0_parse = _time.perf_counter()
                 if text:
                     lines = text.splitlines()
+                    # P1-8: detect mid-file header. start_offset > 0 means
+                    # any header line we encounter here is NOT the legitimate
+                    # file-start header — it's a corruption signal.
+                    header_at_offset_zero_only = (start_offset == 0)
                     for line in lines:
                         if not line:
                             continue
-                        # Skip header if encountered (e.g., on rotation)
-                        # Fast pre-check on first char avoids lowercasing entire line
-                        if (line[0] == 't' or line[0] == 'T') and line[:9].lower() == "timestamp":
-                            continue
+                        # Header detection
+                        is_header = (
+                            (line[0] == 't' or line[0] == 'T')
+                            and line[:9].lower() == "timestamp"
+                        )
+                        if is_header:
+                            if not header_at_offset_zero_only:
+                                # P1-8: header mid-file → force full resync
+                                self._force_tail_resync(
+                                    reason="mid_file_header",
+                                    detail=f"header line at file offset > 0 in {path}",
+                                )
+                                break  # abort this poll's parsing
+                            continue  # legitimate file-start header
                         parts = line.split(",")
                         if len(parts) < 6:
+                            self._tail_malformed_count += 1
+                            if self._tail_malformed_count >= _TAIL_MALFORMED_RESYNC_THRESHOLD:
+                                self._force_tail_resync(
+                                    reason="malformed_threshold",
+                                    detail=(
+                                        f"{self._tail_malformed_count} consecutive "
+                                        f"malformed rows in {path}"
+                                    ),
+                                )
+                                break
                             continue
                         try:
                             ts = int(parts[0])
@@ -1660,8 +1744,20 @@ class CandleIterator:
                         except (ValueError, IndexError):
                             if self.cfg.verbose:
                                 print(f"{WARNING} Skipping malformed CSV row in tail: {line[:80]}{Style.RESET_ALL}")
+                            self._tail_malformed_count += 1
+                            if self._tail_malformed_count >= _TAIL_MALFORMED_RESYNC_THRESHOLD:
+                                self._force_tail_resync(
+                                    reason="malformed_threshold",
+                                    detail=(
+                                        f"{self._tail_malformed_count} consecutive "
+                                        f"malformed rows in {path}"
+                                    ),
+                                )
+                                break
                             continue
 
+                        # Valid row — reset malformed counter
+                        self._tail_malformed_count = 0
                         drained_any = True
                         rows_scanned += 1
                         self._tail_last_line_len = len(line)
@@ -1684,9 +1780,15 @@ class CandleIterator:
                             break
                 tail_parse_s = _time.perf_counter() - t0_parse
 
-                # Advance offset to EOF (we consumed up to current size)
-                self._tail_offset = end_size
-                self._tail_size = end_size
+                # Advance offset to EOF unless a force-resync was triggered
+                # mid-loop (P1-8); in that case keep _tail_offset == 0 so the
+                # next poll re-parses from the beginning.
+                if self._tail_resync_pending:
+                    self._tail_resync_pending = False  # consume flag
+                    self._tail_size = end_size
+                else:
+                    self._tail_offset = end_size
+                    self._tail_size = end_size
 
             except Exception as exc:
                 # If anything goes wrong tailing, do not crash the iterator; next poll will retry
@@ -1845,24 +1947,41 @@ class CandleIterator:
         inode = getattr(st, "st_ino", None)
         dev = getattr(st, "st_dev", None)
         size = st.st_size
+        # P1-5: ctime_ns stored for diagnostics. NOT used as a rotation
+        # trigger — POSIX ctime changes on every append (size update is a
+        # metadata change), so unconditional ctime-based rotation would
+        # cause continuous false-positive resyncs. Inode-reuse safety net
+        # is the content-based detection in _poll_for_new_data_and_buffer
+        # (mid-file header / malformed-burst → P1-8 force-resync).
+        ctime_ns = getattr(
+            st, "st_ctime_ns", int(getattr(st, "st_ctime", 0) * 1_000_000_000)
+        )
 
         # First initialization of tailing
         if self._tail_file_path is None:
             self._tail_file_path = candidate
             self._tail_inode = inode
             self._tail_dev = dev
+            self._tail_ctime_ns = ctime_ns
             self._tail_size = size
             # Start at EOF but we'll backtrack a small window to re-parse last line
             self._tail_offset = size
             return candidate
 
-        # Rotation or replacement (path changed or (inode/dev) changed)
+        # Rotation or replacement (path changed or (inode/dev) changed).
+        # ctime_ns is intentionally NOT in the trigger tuple — see comment above.
         path_changed = (os.path.abspath(candidate) != os.path.abspath(self._tail_file_path))
         sig_changed = (inode != self._tail_inode) or (dev != self._tail_dev)
         if path_changed or sig_changed:
+            reason = "path_changed" if path_changed else "inode_or_dev_changed"
+            print(
+                f"{INFO} tail-follow rotation detected ({reason}) for "
+                f"{candidate}: resetting offset{Style.RESET_ALL}"
+            )
             self._tail_file_path = candidate
             self._tail_inode = inode
             self._tail_dev = dev
+            self._tail_ctime_ns = ctime_ns
             self._tail_size = size
             # On rotation, start from 0 to capture any rows in the new file (still cheap at day start)
             self._tail_offset = 0
@@ -1872,13 +1991,19 @@ class CandleIterator:
         # Same file; detect truncation
         if size < self._tail_offset:
             # File shrank (rewrite) → restart from 0
+            print(
+                f"{INFO} tail-follow truncation detected (shrunk) for "
+                f"{candidate}: size={size} < offset={self._tail_offset}; "
+                f"resetting offset{Style.RESET_ALL}"
+            )
             self._tail_size = size
             self._tail_offset = 0
             self._tail_last_line_len = 0  # reset dynamic backtrack on truncation
             return candidate
 
-        # Normal steady state
+        # Normal steady state (track diagnostic ctime; no rotation decision here)
         self._tail_size = size
+        self._tail_ctime_ns = ctime_ns
         return candidate
 
     def _load_candles_from_disk(self) -> Iterator[Tuple[int, float, float, float, float, float]]:
